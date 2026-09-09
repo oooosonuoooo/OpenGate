@@ -1,0 +1,14 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="OpenGate" Manufacturer="OpenGate" Version="1.0.0" UpgradeCode="E736F5C0-B12B-4B05-95E7-DA9246E06671" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of OpenGate is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="OpenGate">
+        <Component Id="OpenGateBinary" Guid="*">
+          <File Id="OpenGateExe" Source="$(var.OpenGateBinary)" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="OpenGate" Title="OpenGate" Level="1"><ComponentRef Id="OpenGateBinary" /></Feature>
+  </Package>
+</Wix>

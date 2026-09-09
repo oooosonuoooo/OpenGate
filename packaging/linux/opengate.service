@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenGate secure remote access daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opengate
+Group=opengate
+StateDirectory=opengate
+StateDirectoryMode=0700
+ExecStart=/usr/bin/opengate --data-dir /var/lib/opengate daemon
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/opengate
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

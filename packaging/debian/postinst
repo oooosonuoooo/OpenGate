@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+if ! getent passwd opengate >/dev/null; then
+  useradd --system --home-dir /var/lib/opengate --shell /usr/sbin/nologin opengate
+fi
+systemctl daemon-reload
+systemctl enable opengate.service >/dev/null 2>&1 || true

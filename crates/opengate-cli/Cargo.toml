@@ -1,0 +1,43 @@
+[package]
+name = "opengate-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "opengate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+rand.workspace = true
+hex.workspace = true
+subtle.workspace = true
+libp2p.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+directories.workspace = true
+fs2.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+opengate-core.workspace = true
+opengate-protocol.workspace = true
+opengate-security.workspace = true
+opengate-network.workspace = true
+opengate-terminal.workspace = true
+opengate-files.workspace = true
+opengate-tunnel.workspace = true
+opengate-service.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

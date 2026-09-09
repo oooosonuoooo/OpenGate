@@ -1,0 +1,18 @@
+[package]
+name = "opengate-files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+sha2.workspace = true
+hex.workspace = true
+cap-std.workspace = true
+opengate-protocol.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

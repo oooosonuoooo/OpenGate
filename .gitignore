@@ -1,0 +1,9 @@
+/target/
+/dist/
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.log
+__pycache__/
+.op engate/
