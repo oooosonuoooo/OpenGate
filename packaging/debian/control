@@ -4,5 +4,6 @@ Section: net
 Priority: optional
 Architecture: amd64
 Maintainer: OpenGate maintainers <security@opengate.invalid>
+Depends: adduser, systemd
 Description: Secure peer-to-peer remote access daemon
  OpenGate provides owner-authorized remote terminal, file and tunnel access.

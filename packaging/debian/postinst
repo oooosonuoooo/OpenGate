@@ -1,7 +1,10 @@
 #!/bin/sh
 set -e
-if ! getent passwd opengate >/dev/null; then
-  useradd --system --home-dir /var/lib/opengate --shell /usr/sbin/nologin opengate
+if ! getent passwd opengate >/dev/null 2>&1; then
+  adduser --system --group --home /var/lib/opengate --no-create-home opengate
 fi
-systemctl daemon-reload
-systemctl enable opengate.service >/dev/null 2>&1 || true
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload
+  systemctl enable opengate.service >/dev/null 2>&1 || true
+  systemctl restart opengate.service || { echo "OpenGate was installed but its service could not start; inspect journalctl -u opengate.service." >&2; exit 1; }
+fi

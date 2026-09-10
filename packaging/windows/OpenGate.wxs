@@ -1,14 +1,49 @@
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="OpenGate" Manufacturer="OpenGate" Version="1.0.0" UpgradeCode="E736F5C0-B12B-4B05-95E7-DA9246E06671" Scope="perMachine">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="OpenGate" Manufacturer="OpenGate" Version="$(var.ProductVersion)" UpgradeCode="E736F5C0-B12B-4B05-95E7-DA9246E06671" Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of OpenGate is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLDIR" Name="OpenGate">
         <Component Id="OpenGateBinary" Guid="*">
-          <File Id="OpenGateExe" Source="$(var.OpenGateBinary)" KeyPath="yes" />
+          <File Id="OpenGateExe" Source="$(var.OpenGateBinary)" KeyPath="yes">
+            <Shortcut Id="OpenGateStartMenu" Directory="ProgramMenuFolder" Name="OpenGate" Description="OpenGate secure remote access" Advertise="yes" WorkingDirectory="INSTALLDIR" />
+          </File>
+          <ServiceInstall Id="OpenGateServiceInstall"
+                          Name="OpenGate"
+                          DisplayName="OpenGate secure remote access"
+                          Description="OpenGate owner-authorized secure remote access daemon"
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Account="NT AUTHORITY\LocalService"
+                          Arguments="--data-dir &quot;[CommonAppDataFolder]OpenGate&quot; service-run">
+            <ServiceConfig ServiceSid="unrestricted" OnInstall="yes" OnReinstall="yes" />
+            <util:ServiceConfig FirstFailureActionType="restart"
+                                SecondFailureActionType="restart"
+                                ThirdFailureActionType="restart"
+                                RestartServiceDelayInSeconds="5"
+                                ResetPeriodInDays="1" />
+          </ServiceInstall>
+          <ServiceControl Id="OpenGateServiceControl" Name="OpenGate" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
-    <Feature Id="OpenGate" Title="OpenGate" Level="1"><ComponentRef Id="OpenGateBinary" /></Feature>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="OpenGateDataDirectory" Name="OpenGate">
+        <Component Id="OpenGateStateDirectory" Guid="4AFDB0AC-95B7-4BA3-931D-79FD3628E189">
+          <!-- Apply a protected ACL before StartServices.  The daemon replaces
+               LocalService with the OpenGate service SID before it creates or
+               reads identity, configuration, or trusted-device state. -->
+          <CreateFolder>
+            <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)" />
+          </CreateFolder>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="OpenGate" Title="OpenGate" Level="1">
+      <ComponentRef Id="OpenGateBinary" />
+      <ComponentRef Id="OpenGateStateDirectory" />
+    </Feature>
   </Package>
 </Wix>

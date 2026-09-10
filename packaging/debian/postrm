@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload
+fi
+# Preserve /var/lib/opengate and its account even on purge. Removing trusted
+# identities or shared files requires a separate, deliberate owner operation.
+exit 0

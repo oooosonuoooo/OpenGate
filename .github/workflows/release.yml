@@ -1,0 +1,57 @@
+name: Release packages
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release
+      - run: scripts/package-linux.sh "${GITHUB_REF_NAME#v}" target/release/opengate
+      - uses: actions/upload-artifact@v4
+        with: { name: deb, path: target/packages/*.deb }
+
+  rpm:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: dnf -y install ca-certificates findutils gcc gcc-c++ git make openssl-devel pkgconf-pkg-config rpm-build systemd-rpm-macros
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release
+      - run: scripts/package-linux.sh "${GITHUB_REF_NAME#v}" target/release/opengate
+      - uses: actions/upload-artifact@v4
+        with: { name: rpm, path: target/packages/*.rpm }
+
+  msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release
+      - run: dotnet tool install --global wix --version 4.*
+      - shell: pwsh
+        run: wix extension add WixToolset.Util.wixext
+      - shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          wix build -arch x64 packaging/windows/OpenGate.wxs -ext WixToolset.Util.wixext -d OpenGateBinary="$PWD/target/release/opengate.exe" -d ProductVersion="$version" -o target/OpenGate.msi
+      - uses: actions/upload-artifact@v4
+        with: { name: msi, path: target/OpenGate.msi }
+
+  publish:
+    needs: [deb, rpm, msi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: release-artifacts, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*

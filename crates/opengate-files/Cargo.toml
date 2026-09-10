@@ -12,6 +12,7 @@ serde.workspace = true
 sha2.workspace = true
 hex.workspace = true
 cap-std.workspace = true
+libc.workspace = true
 opengate-protocol.workspace = true
 
 [dev-dependencies]

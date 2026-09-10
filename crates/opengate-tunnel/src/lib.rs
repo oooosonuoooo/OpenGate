@@ -3,12 +3,17 @@
 //! This crate deliberately owns no listener or authorization state.  The daemon
 //! authorizes a target before handing a stream to `serve_with_policy`.
 
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connect an authenticated stream to a loopback TCP service and relay bytes.
 pub async fn serve<S>(stream: S, target: &str, cancel: CancellationToken) -> Result<()>
@@ -21,7 +26,7 @@ where
 /// Connect an authenticated stream to `target` and relay bytes until either side
 /// closes. Non-loopback targets require an explicit daemon policy decision.
 pub async fn serve_with_policy<S>(
-    mut stream: S,
+    stream: S,
     target: &str,
     allow_non_loopback: bool,
     cancel: CancellationToken,
@@ -29,11 +34,35 @@ pub async fn serve_with_policy<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let tcp = connect_target(target, allow_non_loopback, cancel.clone()).await?;
+    bridge(stream, tcp, cancel).await
+}
+
+/// Resolve once, validate the resulting IP addresses, and connect to one of
+/// those pinned addresses.  Daemons can call this before acknowledging a tunnel
+/// open, so a local SOCKS listener never reports success for an unavailable
+/// remote service.
+pub async fn connect_target(
+    target: &str,
+    allow_non_loopback: bool,
+    cancel: CancellationToken,
+) -> Result<TcpStream> {
     let targets = resolve_target(target, allow_non_loopback).await?;
-    let mut tcp = tokio::select! {
-        _ = cancel.cancelled() => return Ok(()),
-        connected = TcpStream::connect(targets.as_slice()) => connected.with_context(|| format!("connecting to {target}"))?,
-    };
+    tokio::select! {
+        _ = cancel.cancelled() => bail!("tunnel connection cancelled"),
+        connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(targets.as_slice())) => {
+            connected
+                .context("timed out connecting to tunnel target")?
+                .with_context(|| format!("connecting to {target}"))
+        }
+    }
+}
+
+/// Relay an already connected, policy-approved TCP socket.
+pub async fn bridge<S>(mut stream: S, mut tcp: TcpStream, cancel: CancellationToken) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     tokio::select! {
         _ = cancel.cancelled() => Ok(()),
         result = tokio::io::copy_bidirectional(&mut stream, &mut tcp) => {
@@ -73,7 +102,10 @@ fn split_target(target: &str) -> Result<(String, u16)> {
     if host.is_empty() || host.contains('[') || host.contains(']') {
         bail!("invalid tunnel target");
     }
-    Ok((host.to_owned(), port.parse().context("invalid target port")?))
+    Ok((
+        host.to_owned(),
+        port.parse().context("invalid target port")?,
+    ))
 }
 
 /// Negotiate a SOCKS5 no-auth CONNECT request and return its requested target.
@@ -163,7 +195,15 @@ mod tests {
     async fn only_loopback_is_default() {
         assert!(resolve_target("127.0.0.1:80", false).await.is_ok());
         assert!(resolve_target("[::1]:80", false).await.is_ok());
-        assert!(resolve_target("8.8.8.8:53", false).await.is_err());
+        let localhost = resolve_target("localhost:80", false).await.unwrap();
+        assert!(localhost.iter().all(|address| address.ip().is_loopback()));
+        // This returns before a TCP attempt: policy examines the parsed public
+        // address, so an allow-list check cannot be bypassed by DNS behavior.
+        assert!(
+            connect_target("8.8.8.8:53", false, CancellationToken::new())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

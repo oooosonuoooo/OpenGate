@@ -41,6 +41,17 @@ where
         .context("opening PTY output")?;
     let writer = pty.master.take_writer().context("opening PTY input")?;
     let (mut input_r, mut output_w) = tokio::io::split(stream);
+    // read_exact-based framing must not be cancelled by unrelated output events.
+    // One reader task owns frame assembly for the lifetime of this stream half.
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(QUEUE);
+    let reader_task = tokio::spawn(async move {
+        while let Ok(frame) = read_frame::<TerminalFrame, _>(&mut input_r).await {
+            if incoming_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _reader_guard = AbortOnDrop(reader_task);
     let (control_tx, mut control_rx) = mpsc::channel::<TerminalFrame>(QUEUE);
     let (out_tx, mut out_rx) = mpsc::channel::<TerminalFrame>(QUEUE);
     let local_cancel = cancel.child_token();
@@ -94,18 +105,15 @@ where
     let mut output_done = false;
     let mut exit_code = None;
     loop {
-        if output_done {
-            if let Some(code) = exit_code {
-                write_frame(&mut output_w, &TerminalFrame::Exit { code }).await?;
-                break;
-            }
+        if output_done && let Some(code) = exit_code {
+            write_frame(&mut output_w, &TerminalFrame::Exit { code }).await?;
+            break;
         }
         tokio::select! {
             _=cancel.cancelled()=>{break},
-            frame=read_frame::<TerminalFrame,_>(&mut input_r) => match frame {
-                Ok(frame @ (TerminalFrame::Input(_) | TerminalFrame::Resize { .. } | TerminalFrame::Close)) => { if control_tx.send(frame).await.is_err(){break} },
-                Ok(_) => break,
-                Err(_) => break,
+            frame=incoming_rx.recv() => match frame {
+                Some(frame @ (TerminalFrame::Input(_) | TerminalFrame::Resize { .. } | TerminalFrame::Close)) => { if control_tx.send(frame).await.is_err(){break} },
+                _ => break,
             },
             outbound=out_rx.recv(), if !output_done => match outbound { Some(frame)=>write_frame(&mut output_w,&frame).await?, None=>output_done=true },
             status=exit_receiver.recv(), if exit_code.is_none()=> { exit_code=Some(status.ok_or_else(||anyhow!("terminal exit waiter stopped"))??); },
@@ -116,6 +124,13 @@ where
     let _ = control.await;
     let _ = output.await;
     Ok(())
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn command(request: &ShellRequest) -> Result<CommandBuilder> {
@@ -148,7 +163,9 @@ fn command(request: &ShellRequest) -> Result<CommandBuilder> {
 }
 fn default_shell() -> String {
     #[cfg(windows)]
-    { "powershell.exe".into() }
+    {
+        "powershell.exe".into()
+    }
     #[cfg(not(windows))]
     {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
@@ -163,6 +180,17 @@ where
 {
     let raw = RawMode::enter()?;
     let (mut read, mut write) = tokio::io::split(stream);
+    let (remote_tx, mut remote_rx) = mpsc::channel(QUEUE);
+    let remote_task = tokio::spawn(async move {
+        loop {
+            let frame = read_frame::<TerminalFrame, _>(&mut read).await;
+            let failed = frame.is_err();
+            if remote_tx.send(frame).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    let _remote_guard = AbortOnDrop(remote_task);
     let (input_tx, mut input_rx) = mpsc::channel::<TerminalFrame>(QUEUE);
     let input = tokio::spawn(async move {
         let mut events = EventStream::new();
@@ -201,14 +229,13 @@ where
                         break;
                     }
                 }
-                Event::Resize(cols, rows) => {
+                Event::Resize(cols, rows)
                     if input_tx
                         .send(TerminalFrame::Resize { rows, cols })
                         .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                        .is_err() =>
+                {
+                    break;
                 }
                 _ => {}
             }
@@ -217,7 +244,7 @@ where
     });
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     write_frame(&mut write, &TerminalFrame::Resize { rows, cols }).await?;
-    let result=async {loop{tokio::select!{frame=input_rx.recv()=>match frame{Some(f)=>write_frame(&mut write,&f).await?,None=>break},frame=read_frame::<TerminalFrame,_>(&mut read)=>match frame?{TerminalFrame::Output(bytes)=>tokio::io::AsyncWriteExt::write_all(&mut tokio::io::stdout(),&bytes).await?,TerminalFrame::Exit{..}|TerminalFrame::Close=>break,_=>{}}}}Ok::<(),anyhow::Error>(())}.await;
+    let result=async {loop{tokio::select!{frame=input_rx.recv()=>match frame{Some(f)=>write_frame(&mut write,&f).await?,None=>break},frame=remote_rx.recv()=>match frame.ok_or_else(||anyhow!("terminal stream closed"))??{TerminalFrame::Output(bytes)=>tokio::io::AsyncWriteExt::write_all(&mut tokio::io::stdout(),&bytes).await?,TerminalFrame::Exit{..}|TerminalFrame::Close=>break,_=>{}}}}Ok::<(),anyhow::Error>(())}.await;
     input.abort();
     drop(raw);
     result
@@ -237,10 +264,19 @@ impl Drop for RawMode {
 struct KillOnDrop(Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        if let Ok(mut killer) = self.0.lock() { let _ = killer.kill(); }
+        if let Ok(mut killer) = self.0.lock() {
+            let _ = killer.kill();
+        }
     }
 }
-fn pty_size(rows:u16,cols:u16)->PtySize { PtySize { rows: rows.clamp(1,MAX_DIMENSION), cols:cols.clamp(1,MAX_DIMENSION), pixel_width:0,pixel_height:0 } }
+fn pty_size(rows: u16, cols: u16) -> PtySize {
+    PtySize {
+        rows: rows.clamp(1, MAX_DIMENSION),
+        cols: cols.clamp(1, MAX_DIMENSION),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
 
 #[cfg(all(test, not(windows)))]
 mod tests {
@@ -269,7 +305,9 @@ mod tests {
         .await?;
         write_frame(
             &mut client,
-            &TerminalFrame::Input(b"printf OPENGATE_PTY_MARKER; exit\r".to_vec()),
+            &TerminalFrame::Input(
+                b"printf OPENGATE_PTY_MARKER; dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\000' x; printf OPENGATE_PTY_TRAILER; exit\r".to_vec(),
+            ),
         )
         .await?;
         let mut output = Vec::new();
@@ -285,8 +323,29 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(String::from_utf8_lossy(&output).contains("OPENGATE_PTY_MARKER"));
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("OPENGATE_PTY_MARKER"));
+        assert!(output.contains("OPENGATE_PTY_TRAILER"));
         task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_terminates_a_running_pty_shell() -> Result<()> {
+        let (server, mut client) = tokio::io::duplex(64 * 1024);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve(
+            server,
+            ShellRequest {
+                shell: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+            cancel.clone(),
+        ));
+        write_frame(&mut client, &TerminalFrame::Input(b"sleep 30\r".to_vec())).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        timeout(Duration::from_secs(3), task).await???;
         Ok(())
     }
 }

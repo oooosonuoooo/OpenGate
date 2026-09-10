@@ -6,4 +6,6 @@
 *.key
 *.log
 __pycache__/
-.op engate/
+.opengate/
+
+/.wix/

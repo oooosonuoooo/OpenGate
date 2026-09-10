@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+# Stop on removal; upgrades keep the old daemon until the new binary is present.
+if [ "${1:-}" = remove ] && [ -d /run/systemd/system ]; then
+  systemctl stop opengate.service || true
+  systemctl disable opengate.service >/dev/null 2>&1 || true
+fi
+exit 0

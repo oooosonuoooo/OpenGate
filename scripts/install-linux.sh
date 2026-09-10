@@ -13,9 +13,13 @@ if [ "$system" -eq 1 ]; then
   install -Dm755 "$bin" /usr/local/bin/opengate
   data=/var/lib/opengate
   if [ "$full_admin" -eq 1 ]; then
-    echo "Set allow_admin = true in $data/config.toml before requesting --full-admin." >&2
+    [ -f "$data/config.toml" ] || { echo "Full Admin needs an existing $data/config.toml with allow_admin = true; install the standard service first, configure it as owner, then retry." >&2; exit 1; }
+    grep -Eq '^[[:space:]]*allow_admin[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$' "$data/config.toml" || { echo "Full Admin requires the owner-approved setting allow_admin = true in $data/config.toml." >&2; exit 1; }
+    set -- --full-admin
+  else
+    set --
   fi
-  exec /usr/local/bin/opengate --data-dir "$data" service install --system $([ "$full_admin" -eq 1 ] && printf '%s' '--full-admin')
+  exec /usr/local/bin/opengate --data-dir "$data" service install --system "$@"
 fi
 install -d "$HOME/.local/bin"
 install -m755 "$bin" "$HOME/.local/bin/opengate"

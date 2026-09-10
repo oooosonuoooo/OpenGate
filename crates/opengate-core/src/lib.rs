@@ -1,10 +1,13 @@
 //! Persistent daemon configuration and the local trust database.
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 pub use opengate_protocol::Permissions;
-use opengate_security::{now, PairingToken};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use opengate_security::{PairingToken, now};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 
 const CONFIG_FILE: &str = "config.toml";
@@ -20,10 +23,13 @@ pub struct Config {
     pub bootstrap_nodes: Vec<String>,
     pub allow_pairing: bool,
     pub allow_admin: bool,
+    pub allow_network_targets: bool,
     pub file_root: PathBuf,
     pub max_connections: u32,
     pub max_streams: usize,
     pub reconnect: bool,
+    pub relay_limits: opengate_network::RelayLimits,
+    pub bandwidth_limit_bytes_per_second: u64,
 }
 
 impl Default for Config {
@@ -40,20 +46,32 @@ impl Default for Config {
                 "/ip4/0.0.0.0/udp/44344/quic-v1".into(),
                 "/ip4/0.0.0.0/tcp/44344".into(),
             ],
-            relay_nodes: vec![], bootstrap_nodes: vec![], allow_pairing: true, allow_admin: false,
-            file_root: PathBuf::from("shared"), max_connections: 32, max_streams: 16, reconnect: true,
+            relay_nodes: vec![],
+            bootstrap_nodes: vec![],
+            allow_pairing: true,
+            allow_admin: false,
+            allow_network_targets: false,
+            file_root: PathBuf::from("shared"),
+            max_connections: 32,
+            max_streams: 16,
+            reconnect: true,
+            relay_limits: opengate_network::RelayLimits::default(),
+            bandwidth_limit_bytes_per_second: 0,
         }
     }
 }
 
 impl Config {
     pub fn load_or_create(dir: &Path) -> Result<Self> {
-        fs::create_dir_all(dir)?;
+        opengate_security::ensure_private_directory(dir)?;
         let path = dir.join(CONFIG_FILE);
         if path.exists() {
-            let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            let text =
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
             let mut config: Self = toml::from_str(&text).context("invalid OpenGate config")?;
-            if config.file_root.is_relative() { config.file_root = dir.join(&config.file_root); }
+            if config.file_root.is_relative() {
+                config.file_root = dir.join(&config.file_root);
+            }
             config.validate()?;
             Ok(config)
         } else {
@@ -67,25 +85,57 @@ impl Config {
 
     pub fn save(&self, dir: &Path) -> Result<()> {
         let mut persisted = self.clone();
-        if let Ok(relative) = self.file_root.strip_prefix(dir) { persisted.file_root = relative.to_path_buf(); }
+        if let Ok(relative) = self.file_root.strip_prefix(dir) {
+            persisted.file_root = relative.to_path_buf();
+        }
         persisted.validate()?;
-        fs::create_dir_all(dir)?;
+        opengate_security::ensure_private_directory(dir)?;
         let path = dir.join(CONFIG_FILE);
         let temp = dir.join(format!(".{CONFIG_FILE}.{}.tmp", Uuid::new_v4()));
         let result = (|| -> Result<()> {
-            fs::write(&temp, toml::to_string_pretty(&persisted)?)?;
+            use std::io::Write;
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut file = options.open(&temp)?;
+            file.write_all(toml::to_string_pretty(&persisted)?.as_bytes())?;
+            file.sync_all()?;
             fs::rename(&temp, &path)?;
             Ok(())
         })();
-        if result.is_err() { let _ = fs::remove_file(temp); }
+        if result.is_err() {
+            let _ = fs::remove_file(temp);
+        }
         result
     }
 
     fn validate(&self) -> Result<()> {
-        if self.name.trim().is_empty() || self.name.len() > 128 { bail!("device name must be 1 to 128 characters"); }
-        if self.listen.is_empty() || self.listen.len() > 16 { bail!("listen addresses must contain 1 to 16 entries"); }
-        for listen in &self.listen { listen.parse::<libp2p::Multiaddr>().context("invalid listen multiaddress")?; }
-        if self.max_connections == 0 || self.max_connections > 10_000 || self.max_streams == 0 || self.max_streams > 1_024 { bail!("connection limits are out of range"); }
+        self.relay_limits.validate()?;
+        if self.name.trim().is_empty()
+            || self.name.len() > 128
+            || self.name.chars().any(char::is_control)
+        {
+            bail!("device name must be 1 to 128 characters");
+        }
+        if self.listen.is_empty() || self.listen.len() > 16 {
+            bail!("listen addresses must contain 1 to 16 entries");
+        }
+        for listen in &self.listen {
+            listen
+                .parse::<libp2p::Multiaddr>()
+                .context("invalid listen multiaddress")?;
+        }
+        if self.max_connections == 0
+            || self.max_connections > 10_000
+            || self.max_streams == 0
+            || self.max_streams > 1_024
+        {
+            bail!("connection limits are out of range");
+        }
         Ok(())
     }
 }
@@ -106,12 +156,38 @@ pub struct Device {
 
 /// A cloneable, path-backed store. Each operation opens a short-lived SQLite connection.
 #[derive(Debug, Clone)]
-pub struct Store { path: PathBuf }
+pub struct Store {
+    path: PathBuf,
+}
 
 impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
-        fs::create_dir_all(dir)?;
-        let store = Self { path: dir.join(DB_FILE) };
+        opengate_security::ensure_private_directory(dir)?;
+        let store = Self {
+            path: dir.join(DB_FILE),
+        };
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let database = options.open(&store.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = database.metadata()?;
+            // SAFETY: geteuid is a side-effect-free OS identity query.
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || !metadata.is_file()
+            {
+                bail!("unsafe trust database ownership or links");
+            }
+            database.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        drop(database);
         let mut connection = store.connection()?;
         store.migrate(&mut connection)?;
         Ok(store)
@@ -121,17 +197,25 @@ impl Store {
         let connection = self.connection()?;
         let mut statement = connection.prepare("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted FROM devices ORDER BY name COLLATE NOCASE, peer_id")?;
         let rows = statement.query_map([], row_device)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
-    pub fn device(&self, selector: &str) -> Result<Device> { self.resolve(selector) }
+    pub fn device(&self, selector: &str) -> Result<Device> {
+        self.resolve(selector)
+    }
 
     pub fn trust(&self, device: &Device) -> Result<()> {
         validate_device(device)?;
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         upsert_device(&tx, device)?;
-        audit_tx(&tx, "device_trusted", Some(&device.peer_id), "trusted device recorded")?;
+        audit_tx(
+            &tx,
+            "device_trusted",
+            Some(&device.peer_id),
+            "trusted device recorded",
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -140,8 +224,16 @@ impl Store {
         let device = self.resolve(selector)?;
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE devices SET trusted = 0 WHERE peer_id = ?1", [&device.peer_id])?;
-        audit_tx(&tx, "device_revoked", Some(&device.peer_id), "trust revoked")?;
+        tx.execute(
+            "UPDATE devices SET trusted = 0 WHERE peer_id = ?1",
+            [&device.peer_id],
+        )?;
+        audit_tx(
+            &tx,
+            "device_revoked",
+            Some(&device.peer_id),
+            "trust revoked",
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -150,14 +242,20 @@ impl Store {
         let device = self.resolve(selector)?;
         validate_name(name)?;
         let connection = self.connection()?;
-        connection.execute("UPDATE devices SET name = ?1 WHERE peer_id = ?2", params![name.trim(), device.peer_id])?;
+        connection.execute(
+            "UPDATE devices SET name = ?1 WHERE peer_id = ?2",
+            params![name.trim(), device.peer_id],
+        )?;
         Ok(())
     }
 
     pub fn set_permissions(&self, selector: &str, permissions: &Permissions) -> Result<()> {
         let device = self.resolve(selector)?;
         let connection = self.connection()?;
-        connection.execute("UPDATE devices SET permissions = ?1 WHERE peer_id = ?2", params![serde_json::to_string(permissions)?, device.peer_id])?;
+        connection.execute(
+            "UPDATE devices SET permissions = ?1 WHERE peer_id = ?2",
+            params![serde_json::to_string(permissions)?, device.peer_id],
+        )?;
         Ok(())
     }
 
@@ -165,7 +263,10 @@ impl Store {
         peer.parse::<libp2p::PeerId>().context("invalid peer id")?;
         validate_addresses(addresses)?;
         let connection = self.connection()?;
-        connection.execute("UPDATE devices SET addresses = ?1, last_connected = ?2 WHERE peer_id = ?3", params![serde_json::to_string(addresses)?, now() as i64, peer])?;
+        connection.execute(
+            "UPDATE devices SET addresses = ?1, last_connected = ?2 WHERE peer_id = ?3",
+            params![serde_json::to_string(addresses)?, now() as i64, peer],
+        )?;
         Ok(())
     }
 
@@ -183,7 +284,12 @@ impl Store {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE pairing_tokens SET active = 0 WHERE active = 1", [])?;
         tx.execute("INSERT INTO pairing_tokens(secret_hash, expires_at, permissions, active, created_at) VALUES(?1, ?2, ?3, 1, ?4)", params![token.secret_hash(), token.expires_at as i64, serde_json::to_string(permissions)?, now() as i64])?;
-        audit_tx(&tx, "pairing_created", Some(&token.peer_id), "one-time pairing enabled")?;
+        audit_tx(
+            &tx,
+            "pairing_created",
+            Some(&token.peer_id),
+            "one-time pairing enabled",
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -194,13 +300,27 @@ impl Store {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let hash = sha256_hex(secret);
         let permissions: Option<String> = tx.query_row("SELECT permissions FROM pairing_tokens WHERE secret_hash = ?1 AND active = 1 AND expires_at > ?2", params![hash, now() as i64], |row| row.get(0)).optional()?;
-        let permissions = permissions.ok_or_else(|| anyhow!("pairing secret is invalid, expired, or already used"))?;
-        let changed = tx.execute("UPDATE pairing_tokens SET active = 0 WHERE secret_hash = ?1 AND active = 1", [hash])?;
-        if changed != 1 { bail!("pairing secret was already consumed"); }
-        let permissions: Permissions = serde_json::from_str(&permissions).context("stored pairing permission is invalid")?;
-        let mut trusted = device.clone(); trusted.permissions = permissions.clone(); trusted.trusted = true;
+        let permissions = permissions
+            .ok_or_else(|| anyhow!("pairing secret is invalid, expired, or already used"))?;
+        let changed = tx.execute(
+            "UPDATE pairing_tokens SET active = 0 WHERE secret_hash = ?1 AND active = 1",
+            [hash],
+        )?;
+        if changed != 1 {
+            bail!("pairing secret was already consumed");
+        }
+        let permissions: Permissions =
+            serde_json::from_str(&permissions).context("stored pairing permission is invalid")?;
+        let mut trusted = device.clone();
+        trusted.permissions = permissions.clone();
+        trusted.trusted = true;
         upsert_device(&tx, &trusted)?;
-        audit_tx(&tx, "pairing_consumed", Some(&device.peer_id), "device enrolled")?;
+        audit_tx(
+            &tx,
+            "pairing_consumed",
+            Some(&device.peer_id),
+            "device enrolled",
+        )?;
         tx.commit()?;
         Ok(permissions)
     }
@@ -214,44 +334,85 @@ impl Store {
     pub fn claim_request(&self, peer: &str, request_id: Uuid) -> Result<()> {
         peer.parse::<libp2p::PeerId>().context("invalid peer id")?;
         let connection = self.connection()?;
-        match connection.execute("INSERT INTO requests(peer_id, request_id, created_at) VALUES(?1, ?2, ?3)", params![peer, request_id.to_string(), now() as i64]) {
+        match connection.execute(
+            "INSERT INTO requests(peer_id, request_id, created_at) VALUES(?1, ?2, ?3)",
+            params![peer, request_id.to_string(), now() as i64],
+        ) {
             Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::ConstraintViolation => bail!("replayed request rejected"),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                bail!("replayed request rejected")
+            }
             Err(error) => Err(error.into()),
         }
     }
 
     pub fn audit(&self, event: &str, peer: Option<&str>, detail: &str) -> Result<()> {
         validate_event(event)?;
-        if let Some(peer) = peer { peer.parse::<libp2p::PeerId>().context("invalid audit peer")?; }
+        if let Some(peer) = peer {
+            peer.parse::<libp2p::PeerId>()
+                .context("invalid audit peer")?;
+        }
         let connection = self.connection()?;
-        connection.execute("INSERT INTO audit_log(event, peer_id, detail, created_at) VALUES(?1, ?2, ?3, ?4)", params![event, peer, safe_detail(detail), now() as i64])?;
+        connection.execute(
+            "INSERT INTO audit_log(event, peer_id, detail, created_at) VALUES(?1, ?2, ?3, ?4)",
+            params![event, peer, safe_detail(detail), now() as i64],
+        )?;
         Ok(())
     }
 
     pub fn logs(&self, limit: usize) -> Result<Vec<String>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT event, peer_id, detail, created_at FROM audit_log ORDER BY id DESC LIMIT ?1")?;
+        let mut statement = connection.prepare(
+            "SELECT event, peer_id, detail, created_at FROM audit_log ORDER BY id DESC LIMIT ?1",
+        )?;
         let rows = statement.query_map([limit.min(1_000) as i64], |row| {
-            let event: String = row.get(0)?; let peer: Option<String> = row.get(1)?; let detail: String = row.get(2)?; let created: i64 = row.get(3)?;
-            Ok(format!("{created} {event} {} {detail}", peer.unwrap_or_else(|| "local".into())))
+            let event: String = row.get(0)?;
+            let peer: Option<String> = row.get(1)?;
+            let detail: String = row.get(2)?;
+            let created: i64 = row.get(3)?;
+            Ok(format!(
+                "{created} {event} {} {detail}",
+                peer.unwrap_or_else(|| "local".into())
+            ))
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     fn resolve(&self, selector: &str) -> Result<Device> {
         let selector = selector.trim();
-        if selector.is_empty() { bail!("device selector is empty"); }
+        if selector.is_empty() {
+            bail!("device selector is empty");
+        }
         if let Ok(index) = selector.parse::<usize>() {
-            if index == 0 { bail!("device numbers start at 1"); }
-            return self.devices()?.into_iter().nth(index - 1).ok_or_else(|| anyhow!("device number not found"));
+            if index == 0 {
+                bail!("device numbers start at 1");
+            }
+            return self
+                .devices()?
+                .into_iter()
+                .nth(index - 1)
+                .ok_or_else(|| anyhow!("device number not found"));
         }
         let connection = self.connection()?;
         let exact_peer = connection.query_row("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted FROM devices WHERE peer_id = ?1", [selector], row_device).optional()?;
-        if let Some(device) = exact_peer { return Ok(device); }
+        if let Some(device) = exact_peer {
+            return Ok(device);
+        }
         let mut statement = connection.prepare("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted FROM devices WHERE name = ?1 COLLATE NOCASE")?;
-        let matches = statement.query_map([selector], row_device)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        match matches.len() { 0 => bail!("device not found"), 1 => Ok(matches.into_iter().next().unwrap()), _ => bail!("device name is ambiguous; use its peer id") }
+        let matches = statement
+            .query_map([selector], row_device)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match matches.len() {
+            0 => bail!("device not found"),
+            1 => matches
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("device not found")),
+            _ => bail!("device name is ambiguous; use its peer id"),
+        }
     }
 
     fn connection(&self) -> Result<Connection> {
@@ -262,12 +423,21 @@ impl Store {
     }
 
     fn migrate(&self, connection: &mut Connection) -> Result<()> {
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER NOT NULL);")?;
-        let current: Option<i64> = connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row.get(0)).optional()?.flatten();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER NOT NULL);",
+        )?;
+        let current: Option<i64> = tx
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
         let current = current.unwrap_or(0);
-        if current > SCHEMA_VERSION { bail!("trust database uses newer schema {current}"); }
+        if current > SCHEMA_VERSION {
+            bail!("trust database uses newer schema {current}");
+        }
         if current < 1 {
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch("\
                 CREATE TABLE devices (peer_id TEXT PRIMARY KEY NOT NULL, public_key BLOB NOT NULL, device_id TEXT NOT NULL, name TEXT NOT NULL, os TEXT NOT NULL, permissions TEXT NOT NULL, addresses TEXT NOT NULL, paired_at INTEGER NOT NULL, last_connected INTEGER, trusted INTEGER NOT NULL CHECK(trusted IN (0,1)));\
                 CREATE TABLE pairing_tokens (secret_hash TEXT PRIMARY KEY NOT NULL, expires_at INTEGER NOT NULL, permissions TEXT NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)), created_at INTEGER NOT NULL);\
@@ -275,43 +445,243 @@ impl Store {
                 CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, peer_id TEXT, detail TEXT NOT NULL, created_at INTEGER NOT NULL);\
             ")?;
             tx.execute("INSERT INTO schema_migrations(version) VALUES(1)", [])?;
-            tx.commit()?;
         }
+        tx.commit()?;
         Ok(())
     }
 }
 
 fn row_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
-    let paired_at: i64 = row.get(7)?; let last: Option<i64> = row.get(8)?; let trusted: i64 = row.get(9)?;
-    Ok(Device { peer_id: row.get(0)?, public_key: row.get(1)?, device_id: row.get(2)?, name: row.get(3)?, os: row.get(4)?, permissions: serde_json::from_str(&row.get::<_, String>(5)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?, addresses: serde_json::from_str(&row.get::<_, String>(6)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?, paired_at: paired_at as u64, last_connected: last.map(|value| value as u64), trusted: trusted != 0 })
+    let paired_at: i64 = row.get(7)?;
+    let last: Option<i64> = row.get(8)?;
+    let trusted: i64 = row.get(9)?;
+    Ok(Device {
+        peer_id: row.get(0)?,
+        public_key: row.get(1)?,
+        device_id: row.get(2)?,
+        name: row.get(3)?,
+        os: row.get(4)?,
+        permissions: serde_json::from_str(&row.get::<_, String>(5)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        addresses: serde_json::from_str(&row.get::<_, String>(6)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        paired_at: paired_at as u64,
+        last_connected: last.map(|value| value as u64),
+        trusted: trusted != 0,
+    })
 }
 
 fn upsert_device(tx: &rusqlite::Transaction<'_>, device: &Device) -> Result<()> {
     tx.execute("INSERT INTO devices(peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(peer_id) DO UPDATE SET public_key=excluded.public_key, device_id=excluded.device_id, name=excluded.name, os=excluded.os, permissions=excluded.permissions, addresses=excluded.addresses, last_connected=excluded.last_connected, trusted=excluded.trusted", params![device.peer_id, device.public_key, device.device_id, device.name, device.os, serde_json::to_string(&device.permissions)?, serde_json::to_string(&device.addresses)?, device.paired_at as i64, device.last_connected.map(|v| v as i64), i64::from(device.trusted)])?;
     Ok(())
 }
-fn audit_tx(tx: &rusqlite::Transaction<'_>, event: &str, peer: Option<&str>, detail: &str) -> Result<()> { tx.execute("INSERT INTO audit_log(event, peer_id, detail, created_at) VALUES(?1, ?2, ?3, ?4)", params![event, peer, safe_detail(detail), now() as i64])?; Ok(()) }
-fn validate_name(name: &str) -> Result<()> { if name.trim().is_empty() || name.len() > 128 || name.contains('\0') { bail!("device name must be 1 to 128 printable characters"); } Ok(()) }
-fn validate_addresses(addresses: &[String]) -> Result<()> { if addresses.len() > 32 { bail!("too many device addresses"); } for address in addresses { if address.len() > 512 { bail!("device address is too long"); } address.parse::<libp2p::Multiaddr>().context("invalid device multiaddress")?; } Ok(()) }
+fn audit_tx(
+    tx: &rusqlite::Transaction<'_>,
+    event: &str,
+    peer: Option<&str>,
+    detail: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO audit_log(event, peer_id, detail, created_at) VALUES(?1, ?2, ?3, ?4)",
+        params![event, peer, safe_detail(detail), now() as i64],
+    )?;
+    Ok(())
+}
+fn validate_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() || name.len() > 128 || name.contains('\0') {
+        bail!("device name must be 1 to 128 printable characters");
+    }
+    Ok(())
+}
+fn validate_addresses(addresses: &[String]) -> Result<()> {
+    if addresses.len() > 32 {
+        bail!("too many device addresses");
+    }
+    for address in addresses {
+        if address.len() > 512 {
+            bail!("device address is too long");
+        }
+        address
+            .parse::<libp2p::Multiaddr>()
+            .context("invalid device multiaddress")?;
+    }
+    Ok(())
+}
 fn validate_device(device: &Device) -> Result<()> {
-    let peer = device.peer_id.parse::<libp2p::PeerId>().context("invalid device peer id")?;
-    if device.public_key.is_empty() || device.public_key.len() > 4096 { bail!("invalid device public key"); }
-    let public = libp2p::identity::PublicKey::try_decode_protobuf(&device.public_key).context("invalid device public key encoding")?;
-    if public.to_peer_id() != peer { bail!("device public key does not match peer id"); }
+    let peer = device
+        .peer_id
+        .parse::<libp2p::PeerId>()
+        .context("invalid device peer id")?;
+    if device.public_key.is_empty() || device.public_key.len() > 4096 {
+        bail!("invalid device public key");
+    }
+    let public = libp2p::identity::PublicKey::try_decode_protobuf(&device.public_key)
+        .context("invalid device public key encoding")?;
+    if public.to_peer_id() != peer {
+        bail!("device public key does not match peer id");
+    }
     Uuid::parse_str(&device.device_id).context("invalid device id")?;
     validate_name(&device.name)?;
-    if device.os.len() > 128 { bail!("device OS value is too long"); }
+    if device.os.len() > 128 {
+        bail!("device OS value is too long");
+    }
     validate_addresses(&device.addresses)
 }
-fn validate_event(event: &str) -> Result<()> { if event.is_empty() || event.len() > 64 || !event.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { bail!("invalid audit event"); } Ok(()) }
-fn safe_detail(detail: &str) -> String { let lower = detail.to_ascii_lowercase(); if lower.contains("secret") || lower.contains("token") || lower.contains("password") || lower.contains("clipboard") || lower.contains("command") { "redacted sensitive detail".into() } else { detail.chars().filter(|c| !c.is_control()).take(256).collect() } }
-fn sha256_hex(value: &str) -> String { use sha2::Digest; hex::encode(sha2::Sha256::digest(value.as_bytes())) }
+fn validate_event(event: &str) -> Result<()> {
+    if event.is_empty()
+        || event.len() > 64
+        || !event
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        bail!("invalid audit event");
+    }
+    Ok(())
+}
+fn safe_detail(detail: &str) -> String {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("password")
+        || lower.contains("clipboard")
+        || lower.contains("command")
+    {
+        "redacted sensitive detail".into()
+    } else {
+        detail
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(256)
+            .collect()
+    }
+}
+fn sha256_hex(value: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(value.as_bytes()))
+}
 
 #[cfg(test)]
 mod tests {
-    use super::*; use libp2p::identity; use std::{sync::Arc, thread}; use tempfile::tempdir;
-    fn device() -> Device { let key = identity::Keypair::generate_ed25519(); Device { peer_id: key.public().to_peer_id().to_string(), public_key: key.public().encode_protobuf(), device_id: Uuid::new_v4().to_string(), name: "Office".into(), os: "Linux".into(), permissions: Permissions::view_only(), addresses: vec!["/ip4/127.0.0.1/tcp/44344".into()], paired_at: now(), last_connected: None, trusted: true } }
-    #[test] fn revocation_rechecks_authorization_and_replay_is_durable() { let temp=tempdir().unwrap(); let store=Store::open(temp.path()).unwrap(); let d=device(); store.trust(&d).unwrap(); assert_eq!(store.authorize(&d.peer_id).unwrap().permissions, Permissions::view_only()); store.set_permissions(&d.peer_id, &Permissions::standard()).unwrap(); assert_eq!(Store::open(temp.path()).unwrap().authorize(&d.peer_id).unwrap().permissions, Permissions::standard()); let request=Uuid::new_v4(); store.claim_request(&d.peer_id,request).unwrap(); assert!(store.claim_request(&d.peer_id,request).is_err()); store.revoke(&d.peer_id).unwrap(); assert!(store.authorize(&d.peer_id).is_err()); }
-    #[test] fn pairing_is_atomic_and_single_use() { let temp=tempdir().unwrap(); let store=Arc::new(Store::open(temp.path()).unwrap()); let host=identity::Keypair::generate_ed25519().public().to_peer_id().to_string(); let token=PairingToken::generate(host,vec!["/ip4/127.0.0.1/tcp/44344".into()],60).unwrap(); store.create_pairing(&token,&Permissions::standard()).unwrap(); let mut workers=Vec::new(); for _ in 0..8 { let s=store.clone(); let secret=token.secret.clone(); workers.push(thread::spawn(move || s.consume_pairing(&secret,&device()).is_ok())); } assert_eq!(workers.into_iter().map(|w| w.join().unwrap()).filter(|ok| *ok).count(),1); }
-    #[test] fn newer_schema_is_rejected() { let temp=tempdir().unwrap(); let store=Store::open(temp.path()).unwrap(); let connection=Connection::open(&store.path).unwrap(); connection.execute("INSERT INTO schema_migrations(version) VALUES(99)",[]).unwrap(); assert!(Store::open(temp.path()).is_err()); }
+    use super::*;
+    use libp2p::identity;
+    use std::{sync::Arc, thread};
+    use tempfile::tempdir;
+    fn device() -> Device {
+        let key = identity::Keypair::generate_ed25519();
+        Device {
+            peer_id: key.public().to_peer_id().to_string(),
+            public_key: key.public().encode_protobuf(),
+            device_id: Uuid::new_v4().to_string(),
+            name: "Office".into(),
+            os: "Linux".into(),
+            permissions: Permissions::view_only(),
+            addresses: vec!["/ip4/127.0.0.1/tcp/44344".into()],
+            paired_at: now(),
+            last_connected: None,
+            trusted: true,
+        }
+    }
+    #[test]
+    fn revocation_rechecks_authorization_and_replay_is_durable() {
+        let temp = tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let d = device();
+        store.trust(&d).unwrap();
+        assert_eq!(
+            store.authorize(&d.peer_id).unwrap().permissions,
+            Permissions::view_only()
+        );
+        store
+            .set_permissions(&d.peer_id, &Permissions::standard())
+            .unwrap();
+        assert_eq!(
+            Store::open(temp.path())
+                .unwrap()
+                .authorize(&d.peer_id)
+                .unwrap()
+                .permissions,
+            Permissions::standard()
+        );
+        let request = Uuid::new_v4();
+        store.claim_request(&d.peer_id, request).unwrap();
+        assert!(store.claim_request(&d.peer_id, request).is_err());
+        store.revoke(&d.peer_id).unwrap();
+        assert!(store.authorize(&d.peer_id).is_err());
+    }
+    #[test]
+    fn pairing_is_atomic_and_single_use() {
+        let temp = tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let host = identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        let token =
+            PairingToken::generate(host, vec!["/ip4/127.0.0.1/tcp/44344".into()], 60).unwrap();
+        store
+            .create_pairing(&token, &Permissions::standard())
+            .unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            let secret = token.secret.clone();
+            workers.push(thread::spawn(move || {
+                s.consume_pairing(&secret, &device()).is_ok()
+            }));
+        }
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|w| w.join().unwrap())
+                .filter(|ok| *ok)
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn newer_schema_is_rejected() {
+        let temp = tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let connection = Connection::open(&store.path).unwrap();
+        connection
+            .execute("INSERT INTO schema_migrations(version) VALUES(99)", [])
+            .unwrap();
+        assert!(Store::open(temp.path()).is_err());
+    }
+    #[test]
+    fn concurrent_database_initialization_is_safe() {
+        let temp = tempdir().unwrap();
+        let path = std::sync::Arc::new(temp.path().to_owned());
+        let jobs = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open(&path).map(|_| ()))
+            })
+            .collect::<Vec<_>>();
+        for job in jobs {
+            job.join().unwrap().unwrap();
+        }
+    }
+    #[test]
+    fn cancelled_and_expired_pairing_are_rejected() {
+        let temp = tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let host = identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        let token =
+            PairingToken::generate(host, vec!["/ip4/127.0.0.1/tcp/44344".into()], 60).unwrap();
+        store
+            .create_pairing(&token, &Permissions::standard())
+            .unwrap();
+        store.cancel_pairing().unwrap();
+        assert!(store.consume_pairing(&token.secret, &device()).is_err());
+        let c = Connection::open(&store.path).unwrap();
+        c.execute("UPDATE pairing_tokens SET active=1,expires_at=0", [])
+            .unwrap();
+        assert!(store.consume_pairing(&token.secret, &device()).is_err());
+    }
 }

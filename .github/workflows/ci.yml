@@ -13,6 +13,19 @@ jobs:
       - run: cargo build --workspace --release
       - run: cargo install cargo-audit --locked && cargo audit
       - run: scripts/package-linux.sh 0.1.0 target/release/opengate
+      - uses: actions/upload-artifact@v4
+        with: { name: opengate-linux-deb, path: target/packages/*.deb }
+  rpm:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: dnf -y install ca-certificates findutils gcc gcc-c++ git make openssl-devel pkgconf-pkg-config rpm-build systemd-rpm-macros
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release
+      - run: scripts/package-linux.sh 0.1.0 target/release/opengate
+      - uses: actions/upload-artifact@v4
+        with: { name: opengate-linux-rpm, path: target/packages/*.rpm }
   windows:
     runs-on: windows-latest
     steps:
@@ -23,8 +36,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace --release
-      - run: dotnet tool install --global wix
+      - run: cargo install cargo-audit --locked; cargo audit
+      - run: dotnet tool install --global wix --version 4.*
       - shell: pwsh
-        run: wix build packaging/windows/OpenGate.wxs -d OpenGateBinary="$PWD/target/release/opengate.exe" -o target/OpenGate.msi
+        run: wix extension add WixToolset.Util.wixext
+      - shell: pwsh
+        run: wix build -arch x64 packaging/windows/OpenGate.wxs -ext WixToolset.Util.wixext -d OpenGateBinary="$PWD/target/release/opengate.exe" -d ProductVersion="0.1.0" -o target/OpenGate.msi
       - uses: actions/upload-artifact@v4
         with: { name: opengate-windows-msi, path: target/OpenGate.msi }
