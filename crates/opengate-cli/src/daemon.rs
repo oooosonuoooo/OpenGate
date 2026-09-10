@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use libp2p::{PeerId, identity::PublicKey};
 use opengate_cli::traffic::{Counters, Metered};
-use opengate_core::{Config, Device, Store};
+use opengate_core::{Config, ConnectionPreferences, Device, Store};
 use opengate_network::{Incoming, NetworkOptions, Node};
 use opengate_protocol::*;
 use opengate_security::{Identity, PairingToken, now, secure_read, secure_write};
@@ -85,7 +85,7 @@ pub async fn run_with_stop(
     )
     .await?;
     for device in store.devices()? {
-        if device.trusted {
+        if device.trusted && device.connection_preferences.auto_reconnect {
             node.add_peer(device.peer_id.parse()?, device.addresses)
                 .await?;
         }
@@ -250,6 +250,7 @@ fn checked_device(peer: PeerId, hello: PeerHello, permissions: Permissions) -> R
         os: hello.os,
         permissions,
         addresses: hello.addresses,
+        connection_preferences: ConnectionPreferences::default(),
         paired_at: now(),
         last_connected: Some(now()),
         trusted: true,

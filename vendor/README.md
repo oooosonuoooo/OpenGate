@@ -24,6 +24,19 @@ lockfile make the change reproducible without a live Git dependency.
 Remove these overrides when a stable libp2p release incorporates patched
 Hickory. Do not downgrade Hickory to 0.25 or suppress the advisories.
 
+## Relay bandwidth pacing
+
+`libp2p-relay-0.21.1` is an otherwise unmodified crates.io source snapshot with a small local
+patch that adds bounded opaque-byte pacing to Circuit Relay v2. It exposes a per-circuit combined
+direction rate and one aggregate rate shared by every circuit. The copy path retains its fixed-size
+`BufReader` buffering, waits before a paced write, and leaves protocol negotiation and end-to-end
+encryption untouched. OpenGate maps its positive `RelayLimits` rates to this patch; zero is
+rejected by OpenGate rather than silently disabling its specified relay bound.
+
+The patch is intentionally local because libp2p 0.56/relay 0.21.1 has admission, duration, and
+total-byte quotas but no relay throughput pacing API. Remove the override when an upstream stable
+release exposes equivalent per-circuit and aggregate pacing with bounded backpressure.
+
 Upstream source snapshot SHA-256 (before workspace formatting):
 
 - `dns.rs`: `5f6291a1c453fc7c38c3992b4beacaa48741d9b390485ef2ffce186f2e3d7ca7`

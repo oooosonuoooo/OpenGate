@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 const CONFIG_FILE: &str = "config.toml";
 const DB_FILE: &str = "opengate.sqlite3";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -141,6 +141,33 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionPreferences {
+    /// Whether the daemon should retain this trusted peer for background reconnects.
+    pub auto_reconnect: bool,
+    /// Bounds a user-initiated stream open before any request bytes are sent.
+    pub connection_timeout_seconds: u64,
+}
+
+impl Default for ConnectionPreferences {
+    fn default() -> Self {
+        Self {
+            auto_reconnect: true,
+            connection_timeout_seconds: 30,
+        }
+    }
+}
+
+impl ConnectionPreferences {
+    pub fn validate(&self) -> Result<()> {
+        if !(5..=30).contains(&self.connection_timeout_seconds) {
+            bail!("connection_timeout_seconds must be between 5 and 30 seconds");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Device {
     pub peer_id: String,
     pub public_key: Vec<u8>,
@@ -149,6 +176,7 @@ pub struct Device {
     pub os: String,
     pub permissions: Permissions,
     pub addresses: Vec<String>,
+    pub connection_preferences: ConnectionPreferences,
     pub paired_at: u64,
     pub last_connected: Option<u64>,
     pub trusted: bool,
@@ -195,7 +223,7 @@ impl Store {
 
     pub fn devices(&self) -> Result<Vec<Device>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted FROM devices ORDER BY name COLLATE NOCASE, peer_id")?;
+        let mut statement = connection.prepare("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, connection_preferences, paired_at, last_connected, trusted FROM devices ORDER BY name COLLATE NOCASE, peer_id")?;
         let rows = statement.query_map([], row_device)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -259,6 +287,25 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_connection_preferences(
+        &self,
+        selector: &str,
+        preferences: &ConnectionPreferences,
+    ) -> Result<()> {
+        let device = self.resolve(selector)?;
+        preferences.validate()?;
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE devices SET connection_preferences = ?1 WHERE peer_id = ?2",
+            params![serde_json::to_string(preferences)?, device.peer_id],
+        )?;
+        self.audit(
+            "connection_preferences_changed",
+            Some(&device.peer_id),
+            "reconnect policy changed",
+        )
+    }
+
     pub fn touch(&self, peer: &str, addresses: &[String]) -> Result<()> {
         peer.parse::<libp2p::PeerId>().context("invalid peer id")?;
         validate_addresses(addresses)?;
@@ -273,7 +320,7 @@ impl Store {
     pub fn authorize(&self, peer: &str) -> Result<Device> {
         peer.parse::<libp2p::PeerId>().context("invalid peer id")?;
         let connection = self.connection()?;
-        connection.query_row("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted FROM devices WHERE peer_id = ?1 AND trusted = 1", [peer], row_device)
+        connection.query_row("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, connection_preferences, paired_at, last_connected, trusted FROM devices WHERE peer_id = ?1 AND trusted = 1", [peer], row_device)
             .optional()?.ok_or_else(|| anyhow!("peer is not trusted"))
     }
 
@@ -397,11 +444,11 @@ impl Store {
                 .ok_or_else(|| anyhow!("device number not found"));
         }
         let connection = self.connection()?;
-        let exact_peer = connection.query_row("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted FROM devices WHERE peer_id = ?1", [selector], row_device).optional()?;
+        let exact_peer = connection.query_row("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, connection_preferences, paired_at, last_connected, trusted FROM devices WHERE peer_id = ?1", [selector], row_device).optional()?;
         if let Some(device) = exact_peer {
             return Ok(device);
         }
-        let mut statement = connection.prepare("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted FROM devices WHERE name = ?1 COLLATE NOCASE")?;
+        let mut statement = connection.prepare("SELECT peer_id, public_key, device_id, name, os, permissions, addresses, connection_preferences, paired_at, last_connected, trusted FROM devices WHERE name = ?1 COLLATE NOCASE")?;
         let matches = statement
             .query_map([selector], row_device)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -446,15 +493,22 @@ impl Store {
             ")?;
             tx.execute("INSERT INTO schema_migrations(version) VALUES(1)", [])?;
         }
+        if current < 2 {
+            tx.execute(
+                "ALTER TABLE devices ADD COLUMN connection_preferences TEXT NOT NULL DEFAULT '{\"auto_reconnect\":true,\"connection_timeout_seconds\":30}'",
+                [],
+            )?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(2)", [])?;
+        }
         tx.commit()?;
         Ok(())
     }
 }
 
 fn row_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
-    let paired_at: i64 = row.get(7)?;
-    let last: Option<i64> = row.get(8)?;
-    let trusted: i64 = row.get(9)?;
+    let paired_at: i64 = row.get(8)?;
+    let last: Option<i64> = row.get(9)?;
+    let trusted: i64 = row.get(10)?;
     Ok(Device {
         peer_id: row.get(0)?,
         public_key: row.get(1)?,
@@ -467,6 +521,9 @@ fn row_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         addresses: serde_json::from_str(&row.get::<_, String>(6)?).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
         })?,
+        connection_preferences: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        })?,
         paired_at: paired_at as u64,
         last_connected: last.map(|value| value as u64),
         trusted: trusted != 0,
@@ -474,7 +531,7 @@ fn row_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
 }
 
 fn upsert_device(tx: &rusqlite::Transaction<'_>, device: &Device) -> Result<()> {
-    tx.execute("INSERT INTO devices(peer_id, public_key, device_id, name, os, permissions, addresses, paired_at, last_connected, trusted) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(peer_id) DO UPDATE SET public_key=excluded.public_key, device_id=excluded.device_id, name=excluded.name, os=excluded.os, permissions=excluded.permissions, addresses=excluded.addresses, last_connected=excluded.last_connected, trusted=excluded.trusted", params![device.peer_id, device.public_key, device.device_id, device.name, device.os, serde_json::to_string(&device.permissions)?, serde_json::to_string(&device.addresses)?, device.paired_at as i64, device.last_connected.map(|v| v as i64), i64::from(device.trusted)])?;
+    tx.execute("INSERT INTO devices(peer_id, public_key, device_id, name, os, permissions, addresses, connection_preferences, paired_at, last_connected, trusted) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(peer_id) DO UPDATE SET public_key=excluded.public_key, device_id=excluded.device_id, name=excluded.name, os=excluded.os, permissions=excluded.permissions, addresses=excluded.addresses, connection_preferences=excluded.connection_preferences, last_connected=excluded.last_connected, trusted=excluded.trusted", params![device.peer_id, device.public_key, device.device_id, device.name, device.os, serde_json::to_string(&device.permissions)?, serde_json::to_string(&device.addresses)?, serde_json::to_string(&device.connection_preferences)?, device.paired_at as i64, device.last_connected.map(|v| v as i64), i64::from(device.trusted)])?;
     Ok(())
 }
 fn audit_tx(
@@ -527,7 +584,8 @@ fn validate_device(device: &Device) -> Result<()> {
     if device.os.len() > 128 {
         bail!("device OS value is too long");
     }
-    validate_addresses(&device.addresses)
+    validate_addresses(&device.addresses)?;
+    device.connection_preferences.validate()
 }
 fn validate_event(event: &str) -> Result<()> {
     if event.is_empty()
@@ -578,6 +636,7 @@ mod tests {
             os: "Linux".into(),
             permissions: Permissions::view_only(),
             addresses: vec!["/ip4/127.0.0.1/tcp/44344".into()],
+            connection_preferences: ConnectionPreferences::default(),
             paired_at: now(),
             last_connected: None,
             trusted: true,

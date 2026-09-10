@@ -382,6 +382,23 @@ impl Node {
             .map_err(|_| anyhow!("network node stopped disconnecting peer"))?
     }
 
+    /// Stop background reconnect tracking without revoking trust or interrupting
+    /// an already-established application stream. A later explicit `open` is a
+    /// one-shot dial unless the caller tracks the peer again.
+    pub async fn untrack(&self, peer: PeerId) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Untrack {
+                peer,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| anyhow!("network node has stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("network node stopped untracking peer"))?
+    }
+
     pub async fn snapshot(&self) -> Result<Snapshot> {
         let state = self.state.read().await;
         Ok(state.snapshot())
@@ -424,6 +441,10 @@ enum Command {
         reply: oneshot::Sender<Result<()>>,
     },
     Disconnect {
+        peer: PeerId,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Untrack {
         peer: PeerId,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -593,6 +614,11 @@ async fn run_swarm(
                     revoked.insert(peer);
                     let _ = swarm.disconnect_peer_id(peer);
                     state.write().await.set_peer_state(peer, "DISCONNECTED");
+                    let _ = reply.send(Ok(()));
+                }
+                Some(Command::Untrack { peer, reply }) => {
+                    peers.remove(&peer);
+                    state.write().await.peers.remove(&peer);
                     let _ = reply.send(Ok(()));
                 }
                 Some(Command::Shutdown { reply }) => {
@@ -803,7 +829,9 @@ async fn handle_event(
                 entry.connected_at = Some(Instant::now());
                 entry.attempt = 0;
             }
-            state.write().await.set_peer_state(peer_id, "CONNECTED");
+            if peers.contains_key(&peer_id) {
+                state.write().await.set_peer_state(peer_id, "CONNECTED");
+            }
             tracing::debug!(%peer_id, %path, "connection established");
         }
         SwarmEvent::ConnectionClosed {
@@ -826,7 +854,7 @@ async fn handle_event(
                     entry.direct_attempted = false;
                     schedule_retry(entry);
                     state.write().await.set_peer_state(peer_id, "RECONNECTING");
-                } else if !revoked.contains(&peer_id) {
+                } else if !revoked.contains(&peer_id) && peers.contains_key(&peer_id) {
                     state.write().await.set_peer_state(peer_id, "DISCONNECTED");
                 }
             }

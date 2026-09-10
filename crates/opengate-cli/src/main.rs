@@ -1,6 +1,7 @@
 mod client;
 mod clipboard;
 mod daemon;
+mod diagnostics;
 mod tui;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -737,14 +738,7 @@ async fn execute(dir: PathBuf, command: Command) -> Result<()> {
         }
         Command::Clipboard { device, mode } => clipboard::run(dir, device, &mode).await,
         Command::Diagnose { device } => {
-            if let Some(device) = device {
-                let start = std::time::Instant::now();
-                let result = client::rpc(&dir, LocalCommand::Connect { device }).await;
-                print(
-                    serde_json::json!({"authenticated":result.is_ok(),"control_roundtrip_ms":start.elapsed().as_millis(),"error":result.err().map(|e|e.to_string())}),
-                )?;
-            }
-            print(client::rpc(&dir, LocalCommand::Status).await?.data)
+            print(diagnostics::run(&dir, device).await?)
         }
         Command::Scan { seconds } => {
             client::ensure_daemon(&dir).await?;

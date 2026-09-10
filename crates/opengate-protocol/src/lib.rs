@@ -346,6 +346,11 @@ pub enum LocalCommand {
         device: String,
         permissions: Permissions,
     },
+    ConnectionPreferences {
+        device: String,
+        auto_reconnect: Option<bool>,
+        connection_timeout_seconds: Option<u64>,
+    },
     Open {
         device: String,
         request: RemoteRequest,

@@ -20,6 +20,6 @@ Then generate a new pairing invitation. A relay reservation becomes a candidate 
 
 Circuit Relay v2 transports the peer-to-peer encrypted connection. The relay sees endpoints, connection times, durations and byte volumes, but cannot decrypt the application streams. Configure and operate only infrastructure you own or are authorized to use.
 
-The implementation bounds reservations, circuit duration, bytes per circuit, connection counts and reservation/circuit request rates. Per-circuit byte limits are total transfer quotas, not a throughput guarantee. Current aggregate bandwidth and operator configuration coverage is tracked in BUILD_STATUS; do not assume an unimplemented quota exists.
+The implementation bounds reservations, circuit duration, total bytes per circuit, connection counts, reservation/circuit request rates, and opaque circuit throughput. `relay_limits.max_circuit_bandwidth_bytes_per_second` is the maximum combined rate for both directions of one circuit; `relay_limits.max_total_bandwidth_bytes_per_second` is the shared maximum for all circuits on that relay. Both default to bounded values (8 MiB/s and 64 MiB/s), require a positive value, and take effect when the relay daemon starts. The relay paces fixed-size encrypted byte buffers and never decrypts or modifies application data.
 
 DCUtR attempts direct connectivity where the network permits. A relay can remain necessary on symmetric NAT, CGNAT or enterprise firewalls. Public relay deployment, availability and firewall maintenance belong to its owner.
