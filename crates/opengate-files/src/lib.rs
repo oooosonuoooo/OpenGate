@@ -11,7 +11,10 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
 };
-use opengate_protocol::{CHUNK_SIZE, FileEntry, FileReply, FileRequest, read_frame, write_frame};
+use opengate_protocol::{
+    CHUNK_SIZE, ErrorCode, FileEntry, FileReply, FileRequest, classify_error, read_frame,
+    write_frame,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -65,14 +68,14 @@ where
         }
         other => match blocking(move || dispatch(&root, other)).await {
             Ok(reply) => write_frame(&mut stream, &reply).await,
-            Err(error) => write_frame(&mut stream, &FileReply::Error(error.to_string())).await,
+            Err(error) => write_frame(&mut stream, &file_failure(&error)).await,
         },
     };
     // A request-level error is a permanent rejection for this stream (bad path,
     // checksum, offset, or overwrite policy).  Frame it so callers do not mistake
     // a cleanly rejected operation for a transport interruption worth retrying.
     if let Err(error) = result {
-        write_frame(&mut stream, &FileReply::Error(error.to_string())).await
+        write_frame(&mut stream, &file_failure(&error)).await
     } else {
         Ok(())
     }
@@ -309,6 +312,17 @@ where
                 break;
             }
             FileReply::Error(e) => bail!("remote file operation failed: {e}"),
+            FileReply::Failure {
+                code,
+                message,
+                retryable,
+            } => {
+                return Err(anyhow::Error::new(opengate_protocol::OpenGateError::new(
+                    code,
+                    format!("remote file operation failed: {message}"),
+                    retryable,
+                )));
+            }
             _ => bail!("unexpected download frame"),
         }
     }
@@ -445,6 +459,17 @@ where
                 break;
             }
             FileReply::Error(e) => bail!("client file operation failed: {e}"),
+            FileReply::Failure {
+                code,
+                message,
+                retryable,
+            } => {
+                return Err(anyhow::Error::new(opengate_protocol::OpenGateError::new(
+                    code,
+                    format!("client file operation failed: {message}"),
+                    retryable,
+                )));
+            }
             _ => bail!("unexpected upload frame"),
         }
     }
@@ -856,10 +881,36 @@ fn validate_local_destination(destination: &Path, overwrite: bool) -> Result<()>
     Ok(())
 }
 fn reply_result(reply: FileReply) -> Result<FileReply> {
-    if let FileReply::Error(e) = &reply {
-        bail!("remote file operation failed: {e}")
+    match &reply {
+        FileReply::Error(e) => bail!("remote file operation failed: {e}"),
+        FileReply::Failure {
+            code,
+            message,
+            retryable,
+        } => {
+            return Err(anyhow::Error::new(opengate_protocol::OpenGateError::new(
+                *code,
+                format!("remote file operation failed: {message}"),
+                *retryable,
+            )));
+        }
+        _ => {}
     }
     Ok(reply)
+}
+
+fn file_failure(error: &anyhow::Error) -> FileReply {
+    let (code, retryable) = classify_error(error);
+    let code = if matches!(code, ErrorCode::Internal) {
+        ErrorCode::FileTransfer
+    } else {
+        code
+    };
+    FileReply::Failure {
+        code,
+        message: error.to_string(),
+        retryable,
+    }
 }
 fn set_mode(root: &Dir, path: &Path, mode: u32) -> Result<()> {
     #[cfg(unix)]

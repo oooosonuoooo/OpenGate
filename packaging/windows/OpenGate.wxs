@@ -17,7 +17,6 @@
                           ErrorControl="normal"
                           Account="NT AUTHORITY\LocalService"
                           Arguments="--data-dir &quot;[CommonAppDataFolder]OpenGate&quot; service-run">
-            <ServiceConfig ServiceSid="unrestricted" OnInstall="yes" OnReinstall="yes" />
             <util:ServiceConfig FirstFailureActionType="restart"
                                 SecondFailureActionType="restart"
                                 ThirdFailureActionType="restart"
@@ -29,6 +28,20 @@
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="System64Folder" />
+    <!-- MsiServiceConfig is documented as unreliable by Microsoft/WiX. Use
+         the fixed official service controller after installation and before startup.
+         These actions run only inside the normally elevated MSI transaction. -->
+    <CustomAction Id="OpenGateServiceSid" Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; sidtype OpenGate unrestricted"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="OpenGateServiceFailureFlag" Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; failureflag OpenGate 1"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="OpenGateServiceSid" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="OpenGateServiceFailureFlag" After="OpenGateServiceSid" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="OpenGateDataDirectory" Name="OpenGate">
         <Component Id="OpenGateStateDirectory" Guid="4AFDB0AC-95B7-4BA3-931D-79FD3628E189">

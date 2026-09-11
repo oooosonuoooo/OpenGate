@@ -115,6 +115,21 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         self.relay_limits.validate()?;
+        for nodes in [&self.relay_nodes, &self.bootstrap_nodes] {
+            if nodes.len() > 32 {
+                bail!("at most 32 infrastructure nodes may be configured");
+            }
+            for value in nodes {
+                let address: libp2p::Multiaddr =
+                    value.parse().context("invalid infrastructure address")?;
+                if !matches!(
+                    address.iter().last(),
+                    Some(libp2p::multiaddr::Protocol::P2p(_))
+                ) {
+                    bail!("relay/bootstrap address must end in /p2p/<peer-id>");
+                }
+            }
+        }
         if self.name.trim().is_empty()
             || self.name.len() > 128
             || self.name.chars().any(char::is_control)
@@ -708,6 +723,52 @@ mod tests {
             .execute("INSERT INTO schema_migrations(version) VALUES(99)", [])
             .unwrap();
         assert!(Store::open(temp.path()).is_err());
+    }
+    #[test]
+    fn version_one_upgrade_preserves_trust_and_connection_preferences_persist() {
+        let temp = tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let saved = device();
+        store.trust(&saved).unwrap();
+        // Reconstruct the previous schema, with an existing trusted device.
+        let connection = Connection::open(&store.path).unwrap();
+        connection.execute_batch("ALTER TABLE devices DROP COLUMN connection_preferences; DELETE FROM schema_migrations WHERE version = 2;").unwrap();
+        drop(connection);
+        let migrated = Store::open(temp.path()).unwrap();
+        assert_eq!(migrated.authorize(&saved.peer_id).unwrap(), saved);
+        let preferences = ConnectionPreferences {
+            auto_reconnect: false,
+            connection_timeout_seconds: 5,
+        };
+        migrated
+            .set_connection_preferences(&saved.peer_id, &preferences)
+            .unwrap();
+        let reopened = Store::open(temp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .authorize(&saved.peer_id)
+                .unwrap()
+                .connection_preferences,
+            preferences
+        );
+        assert!(
+            reopened
+                .set_connection_preferences(
+                    &saved.peer_id,
+                    &ConnectionPreferences {
+                        auto_reconnect: true,
+                        connection_timeout_seconds: 0
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .authorize(&saved.peer_id)
+                .unwrap()
+                .connection_preferences,
+            preferences
+        );
     }
     #[test]
     fn concurrent_database_initialization_is_safe() {

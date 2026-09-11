@@ -63,3 +63,4 @@ codegen-units = 1
 libp2p-dns = { path = "vendor/libp2p-dns-0.44.0" }
 libp2p-mdns = { path = "vendor/libp2p-mdns-0.48.0" }
 libp2p-relay = { path = "vendor/libp2p-relay-0.21.1" }
+libp2p-stream = { path = "vendor/libp2p-stream-0.4.0-alpha" }

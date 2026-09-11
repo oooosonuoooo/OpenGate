@@ -1,4 +1,4 @@
-# Vendored libp2p DNS compatibility patches
+# Vendored libp2p compatibility and transport patches
 
 OpenGate uses stable libp2p 0.56.0. Its released DNS and mDNS crates depend on
 Hickory 0.25.2, which has no fix on that branch for RUSTSEC-2026-0118 and
@@ -32,10 +32,27 @@ direction rate and one aggregate rate shared by every circuit. The copy path ret
 `BufReader` buffering, waits before a paced write, and leaves protocol negotiation and end-to-end
 encryption untouched. OpenGate maps its positive `RelayLimits` rates to this patch; zero is
 rejected by OpenGate rather than silently disabling its specified relay bound.
+Each traffic direction has an independent pending write permit and shares the
+circuit budget. The copy path also enforces the remaining byte quota before
+every write and checks its lifetime even while traffic continuously progresses.
 
 The patch is intentionally local because libp2p 0.56/relay 0.21.1 has admission, duration, and
 total-byte quotas but no relay throughput pacing API. Remove the override when an upstream stable
 release exposes equivalent per-circuit and aggregate pacing with bounded backpressure.
+
+## Direct stream preference
+
+`libp2p-stream-0.4.0-alpha` retains its published protocol and public API. Its
+connection selector prefers an established direct connection, then direct QUIC,
+instead of choosing randomly between relayed and direct paths. Existing streams
+are left intact; new streams use the preferred path. Closed connections also
+release their sender entry. The obsolete futures `try_next` call uses the current
+equivalent `try_recv` API, with Futures 0.3.32 as its minimum. Tests exercise
+direct selection and relay fallback.
+
+The isolated upstream relay tests explicitly depend on `quickcheck`, which its
+published manifest omitted despite using it in unit tests. This affects test
+builds only. All vendored crates retain their original MIT license notices.
 
 Upstream source snapshot SHA-256 (before workspace formatting):
 

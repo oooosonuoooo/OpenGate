@@ -6,6 +6,12 @@ prompt and accept the normal Windows UAC prompt. It installs the executable in
 under `NT AUTHORITY\LocalService`. The service starts on installation and is
 configured to restart after failures.
 
+The installer sets the service SID and non-crash recovery flag with the official
+Windows service controller before starting it. It avoids the native MSI service
+configuration table that [WiX documents as unreliable](https://docs.firegiant.com/wix/schema/wxs/serviceconfig/).
+The MSI still requires a native Windows build and install/upgrade/uninstall test;
+a Linux cross-built executable does not verify those operations.
+
 The default service state is under:
 
 ```text
@@ -27,6 +33,11 @@ per-user state. Do not copy, loosen ACLs on, or try to decrypt the system
 service state from a normal-user session.
 
 ## Script installation
+
+For the portable ZIP, extract it and run `.\opengate.exe` for user mode. To
+install its included binary as a system service, run
+`.\install-windows.ps1 -Binary .\opengate.exe` and approve the normal UAC prompt.
+Neither method requires Rust, Cargo, Python, or Visual Studio on the end-user PC.
 
 From an elevated PowerShell prompt:
 

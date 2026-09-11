@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 data-encoding.workspace = true
 libp2p.workspace = true
+opengate-protocol.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

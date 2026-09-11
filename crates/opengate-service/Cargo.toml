@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 opengate-core.workspace = true
+opengate-protocol.workspace = true
 tokio-util.workspace = true
 
 [target.'cfg(unix)'.dependencies]

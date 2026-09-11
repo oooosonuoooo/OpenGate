@@ -30,6 +30,7 @@ use libp2p::{
     },
     tcp, yamux,
 };
+use opengate_protocol::{ErrorCode, OpenGateError};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -177,6 +178,12 @@ pub struct ConnectionInfo {
     /// HOLE-PUNCHED (a direct connection following a relayed one), or RELAYED.
     pub path: String,
     pub latency_ms: Option<u64>,
+    pub transport: String,
+    pub encrypted: bool,
+    pub identity_authenticated: bool,
+    pub remote_agent: Option<String>,
+    pub ping_successes: u64,
+    pub ping_failures: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,7 +272,8 @@ impl Node {
                                 "/opengate/1".to_owned(),
                                 key,
                             )
-                            .with_hide_listen_addrs(true),
+                            .with_hide_listen_addrs(true)
+                            .with_agent_version(format!("opengate/{}", env!("CARGO_PKG_VERSION"))),
                         ),
                         ping: ping::Behaviour::new(
                             ping::Config::new()
@@ -335,6 +343,24 @@ impl Node {
         protocol: &str,
         addresses: &[String],
     ) -> Result<PeerStream> {
+        self.open_inner(peer, protocol, addresses, false).await
+    }
+
+    /// Open the control stream used by a fresh pairing invitation. A previously
+    /// revoked peer may be dialled for this one stream, but remains untracked and
+    /// revoked until the application validates the invitation and calls `add_peer`.
+    pub async fn open_pairing(&self, peer: PeerId, addresses: &[String]) -> Result<PeerStream> {
+        self.open_inner(peer, CONTROL_PROTOCOL, addresses, true)
+            .await
+    }
+
+    async fn open_inner(
+        &self,
+        peer: PeerId,
+        protocol: &str,
+        addresses: &[String],
+        allow_revoked: bool,
+    ) -> Result<PeerStream> {
         ensure_protocol(protocol)?;
         let addresses = pinned_addresses(peer, addresses)?;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -343,13 +369,37 @@ impl Node {
                 peer,
                 protocol: protocol.to_owned(),
                 addresses,
+                allow_revoked,
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| anyhow!("network node has stopped"))?;
+            .map_err(|_| {
+                anyhow::Error::new(OpenGateError::new(
+                    ErrorCode::Network,
+                    "network node has stopped",
+                    true,
+                ))
+            })?;
         reply_rx
             .await
-            .map_err(|_| anyhow!("network node stopped opening stream"))?
+            .map_err(|_| {
+                anyhow::Error::new(OpenGateError::new(
+                    ErrorCode::Network,
+                    "network node stopped opening stream",
+                    true,
+                ))
+            })?
+            .map_err(|error| {
+                if error.downcast_ref::<OpenGateError>().is_some() {
+                    error
+                } else {
+                    anyhow::Error::new(OpenGateError::new(
+                        ErrorCode::Network,
+                        error.to_string(),
+                        true,
+                    ))
+                }
+            })
     }
 
     pub async fn add_peer(&self, peer: PeerId, addresses: Vec<String>) -> Result<()> {
@@ -433,6 +483,7 @@ enum Command {
         peer: PeerId,
         protocol: String,
         addresses: Vec<Multiaddr>,
+        allow_revoked: bool,
         reply: oneshot::Sender<Result<PeerStream>>,
     },
     AddPeer {
@@ -458,6 +509,7 @@ struct SharedState {
     peer_id: String,
     listeners: HashSet<String>,
     connections: HashMap<PeerId, ConnectionInfo>,
+    connection_paths: HashMap<libp2p::swarm::ConnectionId, ConnectionInfo>,
     discovered: HashMap<PeerId, HashSet<String>>,
     peers: HashMap<PeerId, String>,
     nat_status: String,
@@ -465,6 +517,44 @@ struct SharedState {
 }
 
 impl SharedState {
+    fn refresh_connection(&mut self, peer: PeerId) {
+        let selected = self
+            .connection_paths
+            .values()
+            .filter(|c| c.peer_id == peer.to_string())
+            .min_by_key(|c| {
+                let route_rank = match c.path.as_str() {
+                    "LAN" => 0,
+                    "IPv6 DIRECT" => 1,
+                    "DIRECT" => 2,
+                    "HOLE-PUNCHED" => 3,
+                    "RELAYED" => 4,
+                    _ => 5,
+                };
+                let transport_rank = if c.transport == "QUIC" { 0 } else { 1 };
+                let samples = c.ping_successes.saturating_add(c.ping_failures);
+                let loss_per_mille = if samples == 0 {
+                    0
+                } else {
+                    c.ping_failures
+                        .saturating_mul(1_000)
+                        .checked_div(samples)
+                        .unwrap_or(0)
+                };
+                (
+                    route_rank,
+                    transport_rank,
+                    loss_per_mille,
+                    c.latency_ms.unwrap_or(u64::MAX),
+                )
+            })
+            .cloned();
+        if let Some(connection) = selected {
+            self.connections.insert(peer, connection);
+        } else {
+            self.connections.remove(&peer);
+        }
+    }
     fn new(peer_id: PeerId) -> Self {
         Self {
             peer_id: peer_id.to_string(),
@@ -557,8 +647,8 @@ async fn run_swarm(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                Some(Command::Open { peer, protocol, addresses, reply }) => {
-                    if revoked.contains(&peer) {
+                Some(Command::Open { peer, protocol, addresses, allow_revoked, reply }) => {
+                    if revoked.contains(&peer) && !allow_revoked {
                         let _ = reply.send(Err(anyhow!("peer {peer} is disconnected; call add_peer before reconnecting")));
                         continue;
                     }
@@ -797,7 +887,10 @@ async fn handle_event(
             }
         }
         SwarmEvent::ConnectionEstablished {
-            peer_id, endpoint, ..
+            peer_id,
+            connection_id,
+            endpoint,
+            ..
         } => {
             if swarm.connected_peers().count() > runtime.max_connections {
                 tracing::warn!(%peer_id, max_connections = runtime.max_connections, "connection limit reached; closing newest connection");
@@ -814,15 +907,32 @@ async fn handle_event(
                 } else {
                     route_label(&remote_address, relay)
                 };
-                shared.connections.insert(
-                    peer_id,
+                shared.connection_paths.insert(
+                    connection_id,
                     ConnectionInfo {
                         peer_id: peer_id.to_string(),
                         address,
                         path: path.to_owned(),
                         latency_ms: None,
+                        transport: if relay {
+                            "Noise/Yamux over circuit relay"
+                        } else if remote_address
+                            .iter()
+                            .any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1))
+                        {
+                            "QUIC"
+                        } else {
+                            "TCP/Noise/Yamux"
+                        }
+                        .to_owned(),
+                        encrypted: true,
+                        identity_authenticated: true,
+                        remote_agent: None,
+                        ping_successes: 0,
+                        ping_failures: 0,
                     },
                 );
+                shared.refresh_connection(peer_id);
                 path
             };
             if let Some(entry) = peers.get_mut(&peer_id) {
@@ -836,11 +946,17 @@ async fn handle_event(
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
+            connection_id,
             num_established,
             cause,
             ..
         } => {
             tracing::debug!(%peer_id, ?cause, num_established, "connection closed");
+            {
+                let mut shared = state.write().await;
+                shared.connection_paths.remove(&connection_id);
+                shared.refresh_connection(peer_id);
+            }
             // A DCUtR direct connection and its relayed predecessor can coexist. Losing one
             // must not report the peer as offline, schedule a redundant reconnect, or disturb
             // application streams that remain on the other connection.
@@ -895,6 +1011,18 @@ async fn handle_event(
             info,
             ..
         })) => {
+            if info.agent_version.len() <= 128 && !info.agent_version.chars().any(char::is_control)
+            {
+                let mut shared = state.write().await;
+                for connection in shared
+                    .connection_paths
+                    .values_mut()
+                    .filter(|c| c.peer_id == peer_id.to_string())
+                {
+                    connection.remote_agent = Some(info.agent_version.clone());
+                }
+                shared.refresh_connection(peer_id);
+            }
             let addresses = info
                 .listen_addrs
                 .into_iter()
@@ -935,12 +1063,20 @@ async fn handle_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
             peer,
-            result: Ok(rtt),
-            ..
+            connection,
+            result,
         })) => {
-            if let Some(connection) = state.write().await.connections.get_mut(&peer) {
-                connection.latency_ms = Some(rtt.as_millis().min(u128::from(u64::MAX)) as u64);
+            let mut shared = state.write().await;
+            if let Some(info) = shared.connection_paths.get_mut(&connection) {
+                match result {
+                    Ok(rtt) => {
+                        info.latency_ms = Some(rtt.as_millis().min(u128::from(u64::MAX)) as u64);
+                        info.ping_successes = info.ping_successes.saturating_add(1);
+                    }
+                    Err(_) => info.ping_failures = info.ping_failures.saturating_add(1),
+                }
             }
+            shared.refresh_connection(peer);
         }
         SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged {
             new,
@@ -953,11 +1089,14 @@ async fn handle_event(
                 let peer = event.remote_peer_id;
                 let mut shared = state.write().await;
                 shared.hole_punched.insert(peer);
-                if let Some(connection) = shared.connections.get_mut(&peer)
-                    && connection.path != "RELAYED"
+                for connection in shared
+                    .connection_paths
+                    .values_mut()
+                    .filter(|c| c.peer_id == peer.to_string() && c.path != "RELAYED")
                 {
                     connection.path = "HOLE-PUNCHED".to_owned();
                 }
+                shared.refresh_connection(peer);
                 tracing::info!(peer = %event.remote_peer_id, "direct connection upgrade succeeded");
             }
         }

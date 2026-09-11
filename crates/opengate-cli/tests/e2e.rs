@@ -172,10 +172,58 @@ async fn pair_shell_files_forward_restart_and_revoke() -> Result<()> {
         .ok,
         "used token accepted twice"
     );
-    a.ok(LocalCommand::Connect {
-        device: b_id.clone(),
-    })
-    .await?;
+    for (daemon, device) in [(&a, &b_id), (&b, &a_id)] {
+        daemon
+            .ok(LocalCommand::ConnectionPreferences {
+                device: device.clone(),
+                auto_reconnect: Some(false),
+                connection_timeout_seconds: Some(5),
+            })
+            .await?;
+    }
+    let authenticated = a
+        .ok(LocalCommand::Connect {
+            device: b_id.clone(),
+        })
+        .await?;
+    ensure!(
+        authenticated["device"]["protocol_version"] == VERSION,
+        "remote protocol version missing"
+    );
+    ensure!(
+        authenticated["device"]["app_version"] == env!("CARGO_PKG_VERSION"),
+        "remote application version missing"
+    );
+    for (daemon, device) in [(&a, &b_id), (&b, &a_id)] {
+        let status = daemon.ok(LocalCommand::Status).await?;
+        ensure!(
+            !status["network"]["peers"]
+                .as_array()
+                .context("tracked peers")?
+                .iter()
+                .any(|p| p["peer_id"] == *device),
+            "manual authentication re-enabled disabled background reconnect"
+        );
+        let connection = status["network"]["connections"]
+            .as_array()
+            .context("connections")?
+            .iter()
+            .find(|p| p["peer_id"] == *device)
+            .context("missing connected peer")?;
+        ensure!(
+            connection["encrypted"] == true
+                && connection["authenticated"] == true
+                && connection["transport"] == "QUIC",
+            "connection security display missing"
+        );
+        daemon
+            .ok(LocalCommand::ConnectionPreferences {
+                device: device.clone(),
+                auto_reconnect: Some(true),
+                connection_timeout_seconds: Some(30),
+            })
+            .await?;
+    }
     // Interactive programs run through a PTY, not a pre-canned command response.
     let mut shell = a
         .open(&b_id, RemoteRequest::Shell(ShellRequest::default()))
@@ -291,7 +339,7 @@ async fn pair_shell_files_forward_restart_and_revoke() -> Result<()> {
     );
     b.ok(LocalCommand::Permissions {
         device: a_id.clone(),
-        permissions,
+        permissions: permissions.clone(),
     })
     .await?;
     // Stop/restart the real peer process on its former port; preserve the state directory.
@@ -329,11 +377,40 @@ async fn pair_shell_files_forward_restart_and_revoke() -> Result<()> {
     })
     .await
     .context("saved peer did not reconnect after daemon restart")?;
-    b.ok(LocalCommand::Revoke { device: a_id }).await?;
+    b.ok(LocalCommand::Revoke {
+        device: a_id.clone(),
+    })
+    .await?;
     ensure!(
-        !a.rpc(LocalCommand::Connect { device: b_id }).await?.ok,
+        !a.rpc(LocalCommand::Connect {
+            device: b_id.clone()
+        })
+        .await?
+        .ok,
         "revoked peer authenticated"
     );
+    // A fresh invitation is the only supported way to restore mutual trust.
+    // Both local network runtimes still carry revocation sentinels here, so this
+    // also proves re-pairing does not require either daemon to restart.
+    a.ok(LocalCommand::Revoke {
+        device: b_id.clone(),
+    })
+    .await?;
+    let replacement = b
+        .ok(LocalCommand::Allow {
+            permissions: permissions.clone(),
+            ttl: 900,
+        })
+        .await?;
+    a.ok(LocalCommand::Pair {
+        token: replacement["token"]
+            .as_str()
+            .context("replacement token")?
+            .to_owned(),
+        grant: permissions,
+    })
+    .await?;
+    a.ok(LocalCommand::Connect { device: b_id }).await?;
     Ok(())
 }
 

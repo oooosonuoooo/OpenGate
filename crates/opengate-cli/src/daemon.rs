@@ -179,6 +179,26 @@ async fn shutdown_signal() {
 }
 
 impl State {
+    async fn status(&self) -> Result<serde_json::Value> {
+        let mut network = serde_json::to_value(self.node.snapshot().await?)?;
+        if let Some(connections) = network["connections"].as_array_mut() {
+            for connection in connections {
+                let saved = connection["peer_id"]
+                    .as_str()
+                    .and_then(|peer| self.store.authorize(peer).ok());
+                connection["trusted"] = serde_json::json!(saved.is_some());
+                connection["authenticated"] = serde_json::json!(saved.is_some());
+                connection["permissions_granted_to_peer"] =
+                    serde_json::to_value(saved.as_ref().map(|d| &d.permissions))?;
+                connection["device_name"] = serde_json::to_value(saved.as_ref().map(|d| &d.name))?;
+            }
+        }
+        Ok(
+            serde_json::json!({"device":self.hello().await?,"network":network,
+            "active_streams":self.stream_capacity-self.streams.available_permits(),"traffic":self.traffic_snapshot().await,
+            "full_admin_enabled":self.config.read().await.allow_admin,"process_elevated":is_elevated()}),
+        )
+    }
     async fn metered<S>(&self, peer: &str, stream: S) -> Metered<S> {
         let counters = self
             .traffic
@@ -200,6 +220,8 @@ impl State {
     async fn hello(&self) -> Result<PeerHello> {
         let snapshot = self.node.snapshot().await?;
         Ok(PeerHello {
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            protocol_version: opengate_protocol::VERSION,
             peer_id: self.identity.peer_id().to_string(),
             public_key: self.identity.keypair.public().encode_protobuf(),
             device_id: self.identity.device_id.to_string(),
@@ -218,6 +240,18 @@ impl State {
 }
 
 fn checked_device(peer: PeerId, hello: PeerHello, permissions: Permissions) -> Result<Device> {
+    ensure!(
+        hello.app_version.len() <= 64 && !hello.app_version.chars().any(char::is_control),
+        "invalid application version"
+    );
+    ensure!(
+        hello.protocol_version == opengate_protocol::VERSION,
+        "incompatible OpenGate version: local {} (protocol {}), remote {} (protocol {}); upgrade required",
+        env!("CARGO_PKG_VERSION"),
+        opengate_protocol::VERSION,
+        hello.app_version,
+        hello.protocol_version
+    );
     ensure!(
         hello.peer_id == peer.to_string(),
         "peer identity does not match encrypted transport"
@@ -263,17 +297,25 @@ async fn open_remote(
     request: RemoteRequest,
 ) -> Result<(Metered<opengate_network::PeerStream>, Reply)> {
     state.store.authorize(&device.peer_id)?;
-    let mut stream = state
-        .node
-        .open(
+    device.connection_preferences.validate()?;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(device.connection_preferences.connection_timeout_seconds),
+        state.node.open(
             device.peer_id.parse()?,
             request.protocol(),
             &device.addresses,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "saved device connection timeout reached",
         )
-        .await
-        .map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::ConnectionAborted, error.to_string())
-        })?;
+    })?
+    .map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::ConnectionAborted, error.to_string())
+    })?;
     let open = OpenRequest {
         request_id: uuid::Uuid::new_v4(),
         request,
@@ -293,13 +335,18 @@ async fn handle_remote(state: Arc<State>, mut incoming: Incoming) -> Result<()> 
     let (data, cancel) = match result {
         Ok(value) => value,
         Err(error) => {
+            let category = match &open.request {
+                RemoteRequest::Pair { .. } => ErrorCode::Pairing,
+                RemoteRequest::Authenticate { .. } => ErrorCode::Authentication,
+                _ => ErrorCode::Authorization,
+            };
+            let error = domain_error(error, category);
             state.store.audit(
                 "authentication_or_permission_rejected",
                 Some(&incoming.peer.to_string()),
                 "request rejected",
             )?;
-            write_frame_with_id(&mut incoming.stream, id, &Reply::failure(error.to_string()))
-                .await?;
+            write_frame_with_id(&mut incoming.stream, id, &Reply::from_error(&error)).await?;
             return Ok(());
         }
     };
@@ -412,7 +459,9 @@ async fn authorize_open(
     if let RemoteRequest::Authenticate { hello } = &open.request {
         let current = checked_device(peer, hello.clone(), device.permissions.clone())?;
         state.store.touch(&peer_text, &current.addresses)?;
-        state.node.add_peer(peer, current.addresses).await?;
+        if device.connection_preferences.auto_reconnect {
+            state.node.add_peer(peer, current.addresses).await?;
+        }
         state.store.audit(
             "connection_authenticated",
             Some(&peer_text),
@@ -549,11 +598,19 @@ async fn handle_local(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
+fn domain_error(error: anyhow::Error, code: ErrorCode) -> anyhow::Error {
+    let (classified, retryable) = classify_error(&error);
+    let code = if classified == ErrorCode::RateLimited {
+        classified
+    } else {
+        code
+    };
+    anyhow::Error::new(OpenGateError::new(code, error.to_string(), retryable))
+}
+
 async fn execute_local(state: &State, command: LocalCommand) -> Result<serde_json::Value> {
     match command {
-        LocalCommand::Status => Ok(
-            serde_json::json!({"device":state.hello().await?,"network":state.node.snapshot().await?,"active_streams":state.stream_capacity-state.streams.available_permits(),"traffic":state.traffic_snapshot().await,"full_admin_enabled":state.config.read().await.allow_admin,"process_elevated":is_elevated()}),
-        ),
+        LocalCommand::Status => state.status().await,
         LocalCommand::Devices => Ok(serde_json::to_value(state.store.devices()?)?),
         LocalCommand::Allow { permissions, ttl } => {
             let config = state.config.read().await;
@@ -594,7 +651,7 @@ async fn execute_local(state: &State, command: LocalCommand) -> Result<serde_jso
                 peer != state.identity.peer_id(),
                 "cannot pair this device with itself"
             );
-            let mut remote = state.node.open(peer, CONTROL, &token.addresses).await?;
+            let mut remote = state.node.open_pairing(peer, &token.addresses).await?;
             let request = OpenRequest {
                 request_id: uuid::Uuid::new_v4(),
                 request: RemoteRequest::Pair {
@@ -638,6 +695,35 @@ async fn execute_local(state: &State, command: LocalCommand) -> Result<serde_jso
         LocalCommand::Rename { device, name } => {
             state.store.rename(&device, &name)?;
             Ok(serde_json::json!({"renamed":true}))
+        }
+        LocalCommand::ConnectionPreferences {
+            device,
+            auto_reconnect,
+            connection_timeout_seconds,
+        } => {
+            let saved = state.store.device(&device)?;
+            let mut preferences = saved.connection_preferences;
+            if auto_reconnect.is_none() && connection_timeout_seconds.is_none() {
+                return Ok(serde_json::to_value(preferences)?);
+            }
+            if let Some(enabled) = auto_reconnect {
+                preferences.auto_reconnect = enabled;
+            }
+            if let Some(seconds) = connection_timeout_seconds {
+                preferences.connection_timeout_seconds = seconds;
+            }
+            state
+                .store
+                .set_connection_preferences(&device, &preferences)?;
+            if preferences.auto_reconnect && saved.trusted {
+                state
+                    .node
+                    .add_peer(saved.peer_id.parse()?, saved.addresses)
+                    .await?;
+            } else {
+                state.node.untrack(saved.peer_id.parse()?).await?;
+            }
+            Ok(serde_json::to_value(preferences)?)
         }
         LocalCommand::Revoke { device } => {
             let saved = state.store.device(&device)?;
@@ -704,12 +790,8 @@ async fn execute_local(state: &State, command: LocalCommand) -> Result<serde_jso
                     );
                     config.file_root = path;
                 }
-                "relay_nodes" => {
-                    config.relay_nodes = serde_json::from_str(&value)?;
-                    for addr in &config.relay_nodes {
-                        let _: libp2p::Multiaddr = addr.parse()?;
-                    }
-                }
+                "relay_nodes" => config.relay_nodes = serde_json::from_str(&value)?,
+                "bootstrap_nodes" => config.bootstrap_nodes = serde_json::from_str(&value)?,
                 "listen" => {
                     config.listen = serde_json::from_str(&value)?;
                     for addr in &config.listen {
@@ -720,14 +802,20 @@ async fn execute_local(state: &State, command: LocalCommand) -> Result<serde_jso
             }
             config.save(&state.dir)?;
             *guard = config;
-            // Changing owner policy invalidates all current remote grants until reopened.
-            for tokens in state.active.lock().await.values() {
-                for token in tokens {
-                    token.cancel();
+            // Security policy changes invalidate existing streams; a nickname or
+            // future network setting does not interrupt a running terminal/transfer.
+            if matches!(
+                key.as_str(),
+                "allow_admin" | "allow_network_targets" | "file_root"
+            ) {
+                for tokens in state.active.lock().await.values() {
+                    for token in tokens {
+                        token.cancel();
+                    }
                 }
             }
             Ok(
-                serde_json::json!({"saved":true,"restart_required":matches!(key.as_str(),"relay_nodes"|"listen"|"reconnect"|"relay_limits"|"max_connections"|"max_streams")}),
+                serde_json::json!({"saved":true,"restart_required":matches!(key.as_str(),"relay_nodes"|"bootstrap_nodes"|"listen"|"reconnect"|"relay_limits"|"max_connections"|"max_streams")}),
             )
         }
         LocalCommand::Shutdown => {

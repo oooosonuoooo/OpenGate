@@ -146,8 +146,20 @@ pub async fn shell(
 pub async fn file_request(dir: &Path, device: &str, request: FileRequest) -> Result<FileReply> {
     let stream = open(dir, device, RemoteRequest::Files).await?;
     let reply = opengate_files::request(stream, request).await?;
-    if let FileReply::Error(message) = &reply {
-        bail!("{message}");
+    match &reply {
+        FileReply::Error(message) => bail!("file transfer: {message}"),
+        FileReply::Failure {
+            code,
+            message,
+            retryable,
+        } => {
+            return Err(anyhow::Error::new(opengate_protocol::OpenGateError::new(
+                *code,
+                message.clone(),
+                *retryable,
+            )));
+        }
+        _ => {}
     }
     Ok(reply)
 }

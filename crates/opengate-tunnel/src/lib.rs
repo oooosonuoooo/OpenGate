@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use opengate_protocol::{ErrorCode, OpenGateError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -47,13 +48,35 @@ pub async fn connect_target(
     allow_non_loopback: bool,
     cancel: CancellationToken,
 ) -> Result<TcpStream> {
-    let targets = resolve_target(target, allow_non_loopback).await?;
+    let targets = resolve_target(target, allow_non_loopback)
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(OpenGateError::new(
+                ErrorCode::Tunnel,
+                error.to_string(),
+                false,
+            ))
+        })?;
     tokio::select! {
-        _ = cancel.cancelled() => bail!("tunnel connection cancelled"),
+        _ = cancel.cancelled() => Err(anyhow::Error::new(OpenGateError::new(
+            ErrorCode::Tunnel,
+            "tunnel connection cancelled",
+            false,
+        ))),
         connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(targets.as_slice())) => {
-            connected
-                .context("timed out connecting to tunnel target")?
-                .with_context(|| format!("connecting to {target}"))
+            match connected {
+                Err(_) => Err(anyhow::Error::new(OpenGateError::new(
+                    ErrorCode::Timeout,
+                    format!("timed out connecting to tunnel target {target}"),
+                    true,
+                ))),
+                Ok(Err(error)) => Err(anyhow::Error::new(OpenGateError::new(
+                    ErrorCode::Tunnel,
+                    format!("connecting to {target}: {error}"),
+                    true,
+                ))),
+                Ok(Ok(stream)) => Ok(stream),
+            }
         }
     }
 }

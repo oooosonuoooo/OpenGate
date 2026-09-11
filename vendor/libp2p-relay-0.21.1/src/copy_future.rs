@@ -74,7 +74,7 @@ impl BandwidthLimiter {
 /// Paces one circuit and, when configured, a relay-wide limiter. A permit remains attached to a
 /// pending write, so a backpressured destination cannot consume additional relay bandwidth.
 struct Pacer {
-    circuit: BandwidthLimiter,
+    circuit: Arc<Mutex<BandwidthLimiter>>,
     aggregate: Option<Arc<Mutex<BandwidthLimiter>>>,
     delay: Option<Delay>,
     permit: Option<usize>,
@@ -86,16 +86,21 @@ impl Pacer {
         aggregate: Option<Arc<Mutex<BandwidthLimiter>>>,
     ) -> Option<Self> {
         (bytes_per_second > 0).then(|| Self {
-            circuit: BandwidthLimiter::new(bytes_per_second),
+            circuit: Arc::new(Mutex::new(BandwidthLimiter::new(bytes_per_second))),
             aggregate,
             delay: None,
             permit: None,
         })
     }
 
+    /// Each direction needs its own pending permit. Only the byte budgets are shared.
+    fn other_direction(&self) -> Self {
+        Self { circuit:self.circuit.clone(), aggregate:self.aggregate.clone(), delay:None, permit:None }
+    }
+
     fn poll_ready(&mut self, bytes: usize, cx: &mut Context<'_>) -> Poll<()> {
         if let Some(permit) = self.permit {
-            debug_assert_eq!(permit, bytes);
+            debug_assert!(bytes <= permit);
             return Poll::Ready(());
         }
 
@@ -123,20 +128,20 @@ impl Pacer {
     }
 
     fn reserve(&mut self, bytes: usize, now: Instant) -> Instant {
+        let mut circuit = self.circuit.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(aggregate) = &self.aggregate {
-            let mut aggregate = aggregate.lock().expect("relay bandwidth limiter lock poisoned");
-            let ready = self
-                .circuit
+            let mut aggregate = aggregate.lock().unwrap_or_else(|error| error.into_inner());
+            let ready = circuit
                 .ready_at(bytes, now)
                 .max(aggregate.ready_at(bytes, now));
             // Both buckets advance to the actual write time. This is intentionally conservative
             // when their rates differ: a delayed per-circuit write cannot later burst through the
             // relay-wide budget that had been reserved at an earlier time.
-            self.circuit.next_available = ready;
+            circuit.next_available = ready;
             aggregate.next_available = ready;
             ready
         } else {
-            self.circuit.reserve_at(bytes, now)
+            circuit.reserve_at(bytes, now)
         }
     }
 
@@ -161,7 +166,8 @@ pub(crate) struct CopyFuture<S, D> {
     max_circuit_duration: Delay,
     max_circuit_bytes: u64,
     bytes_sent: u64,
-    pacer: Option<Pacer>,
+    src_pacer: Option<Pacer>,
+    dst_pacer: Option<Pacer>,
 }
 
 impl<S: AsyncRead, D: AsyncRead> CopyFuture<S, D> {
@@ -173,13 +179,16 @@ impl<S: AsyncRead, D: AsyncRead> CopyFuture<S, D> {
         max_circuit_bytes_per_second: u64,
         bandwidth_limiter: Option<Arc<Mutex<BandwidthLimiter>>>,
     ) -> Self {
+        let src_pacer = Pacer::new(max_circuit_bytes_per_second, bandwidth_limiter);
+        let dst_pacer = src_pacer.as_ref().map(Pacer::other_direction);
         CopyFuture {
             src: BufReader::new(src),
             dst: BufReader::new(dst),
             max_circuit_duration: Delay::new(max_circuit_duration),
             max_circuit_bytes,
             bytes_sent: Default::default(),
-            pacer: Pacer::new(max_circuit_bytes_per_second, bandwidth_limiter),
+            src_pacer,
+            dst_pacer,
         }
     }
 }
@@ -195,6 +204,9 @@ where
         let this = &mut *self;
 
         loop {
+            if this.max_circuit_duration.poll_unpin(cx).is_ready() {
+                return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+            }
             if this.max_circuit_bytes > 0 && this.bytes_sent > this.max_circuit_bytes {
                 return Poll::Ready(Err(io::Error::other("Max circuit bytes reached.")));
             }
@@ -205,10 +217,12 @@ where
                 Progressed,
             }
 
-            let src_status = match forward_data(
+            let remaining = if this.max_circuit_bytes == 0 { u64::MAX } else { this.max_circuit_bytes.saturating_sub(this.bytes_sent) };
+            let src_status = match forward_limited(
                 &mut this.src,
                 &mut this.dst,
-                this.pacer.as_mut(),
+                this.src_pacer.as_mut(),
+                remaining.min(MAX_PACED_WRITE as u64) as usize,
                 cx,
             ) {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -220,10 +234,12 @@ where
                 Poll::Pending => Status::Pending,
             };
 
-            let dst_status = match forward_data(
+            let remaining = if this.max_circuit_bytes == 0 { u64::MAX } else { this.max_circuit_bytes.saturating_sub(this.bytes_sent) };
+            let dst_status = match forward_limited(
                 &mut this.dst,
                 &mut this.src,
-                this.pacer.as_mut(),
+                this.dst_pacer.as_mut(),
+                remaining.min(MAX_PACED_WRITE as u64) as usize,
                 cx,
             ) {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -261,10 +277,11 @@ where
 ///
 /// Returns `0` when done, i.e. `source` having reached EOF, returns number of bytes sent otherwise,
 /// thus indicating progress.
-fn forward_data<S: AsyncBufRead + Unpin, D: AsyncWrite + Unpin>(
+fn forward_limited<S: AsyncBufRead + Unpin, D: AsyncWrite + Unpin>(
     mut src: &mut S,
     mut dst: &mut D,
     mut pacer: Option<&mut Pacer>,
+    remaining: usize,
     cx: &mut Context<'_>,
 ) -> Poll<io::Result<u64>> {
     let buffer = match Pin::new(&mut src).poll_fill_buf(cx)? {
@@ -281,7 +298,10 @@ fn forward_data<S: AsyncBufRead + Unpin, D: AsyncWrite + Unpin>(
         return Poll::Ready(Ok(0));
     }
 
-    let paced_len = buffer.len().min(MAX_PACED_WRITE);
+    if remaining == 0 {
+        return Poll::Ready(Err(io::Error::other("Max circuit bytes reached.")));
+    }
+    let paced_len = buffer.len().min(MAX_PACED_WRITE).min(remaining);
     if let Some(pacer) = pacer.as_mut() {
         ready!(pacer.poll_ready(paced_len, cx));
     }
@@ -308,6 +328,10 @@ mod tests {
     use quickcheck::QuickCheck;
 
     use super::*;
+
+    fn forward_data<S: AsyncBufRead + Unpin, D: AsyncWrite + Unpin>(src: &mut S, dst: &mut D, pacer: Option<&mut Pacer>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        forward_limited(src, dst, pacer, usize::MAX, cx)
+    }
 
     #[test]
     fn quickcheck() {
@@ -448,9 +472,10 @@ mod tests {
         let aggregate = Arc::new(Mutex::new(BandwidthLimiter::new(1_000_000)));
         let mut circuit = Pacer::new(1_000, Some(aggregate)).expect("nonzero circuit rate");
         let now = Instant::now();
+        let mut opposite = circuit.other_direction();
 
         let first = circuit.reserve(1_000, now);
-        let second = circuit.reserve(1_000, now);
+        let second = opposite.reserve(1_000, now);
 
         assert!(first.duration_since(now) >= Duration::from_secs(1));
         assert!(

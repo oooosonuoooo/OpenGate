@@ -12,20 +12,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Cargo downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ github.job }}-cargo-downloads-${{ hashFiles('Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --workspace --release
+      - run: cargo build --locked --workspace --release
       - run: scripts/package-linux.sh "${GITHUB_REF_NAME#v}" target/release/opengate
       - uses: actions/upload-artifact@v4
-        with: { name: deb, path: target/packages/*.deb }
+        with:
+          name: deb
+          path: |
+            target/packages/*.deb
+            target/packages/*.tar.gz
 
   rpm:
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
       - uses: actions/checkout@v4
-      - run: dnf -y install ca-certificates findutils gcc gcc-c++ git make openssl-devel pkgconf-pkg-config rpm-build systemd-rpm-macros
+      - run: dnf -y install ca-certificates findutils gcc gcc-c++ git make openssl-devel pkgconf-pkg-config rpm-build systemd-rpm-macros tar gzip zstd
+      - name: Cache Cargo downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ github.job }}-cargo-downloads-${{ hashFiles('Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --workspace --release
+      - run: cargo build --locked --workspace --release
       - run: scripts/package-linux.sh "${GITHUB_REF_NAME#v}" target/release/opengate
       - uses: actions/upload-artifact@v4
         with: { name: rpm, path: target/packages/*.rpm }
@@ -34,17 +54,36 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Cargo downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ github.job }}-cargo-downloads-${{ hashFiles('Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --workspace --release
+      - run: cargo build --locked --workspace --release
       - run: dotnet tool install --global wix --version 4.*
       - shell: pwsh
         run: wix extension add WixToolset.Util.wixext
       - shell: pwsh
+        env:
+          OPENGATE_RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          $version = $env:OPENGATE_RELEASE_TAG.TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Release tag must be vMAJOR.MINOR.PATCH' }
           wix build -arch x64 packaging/windows/OpenGate.wxs -ext WixToolset.Util.wixext -d OpenGateBinary="$PWD/target/release/opengate.exe" -d ProductVersion="$version" -o target/OpenGate.msi
+          if ($LASTEXITCODE -ne 0) { throw 'MSI build failed' }
+          New-Item -ItemType Directory -Force target/windows-portable | Out-Null
+          Copy-Item target/release/opengate.exe, LICENSE, README.md, INSTALL-WINDOWS.md, scripts/install-windows.ps1 target/windows-portable/
+          Compress-Archive -Path target/windows-portable/* -DestinationPath "target/opengate-$version-windows-x86_64.zip"
       - uses: actions/upload-artifact@v4
-        with: { name: msi, path: target/OpenGate.msi }
+        with:
+          name: msi
+          path: |
+            target/OpenGate.msi
+            target/opengate-*-windows-x86_64.zip
 
   publish:
     needs: [deb, rpm, msi]
@@ -52,6 +91,10 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { path: release-artifacts, merge-multiple: true }
+      - name: Hash release artifacts
+        run: |
+          cd release-artifacts
+          sha256sum ./* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: release-artifacts/*

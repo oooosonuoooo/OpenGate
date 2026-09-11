@@ -9,6 +9,7 @@ anyhow.workspace = true
 futures.workspace = true
 libp2p.workspace = true
 libp2p-stream.workspace = true
+opengate-protocol.workspace = true
 rand.workspace = true
 serde.workspace = true
 tokio.workspace = true

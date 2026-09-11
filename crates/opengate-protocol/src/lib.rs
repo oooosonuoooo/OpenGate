@@ -1,7 +1,9 @@
 //! Bounded, versioned OpenGate framing over mutually authenticated encrypted streams.
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
+use std::fmt;
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -14,6 +16,123 @@ pub const FILES: &str = "/opengate/files/1";
 pub const TUNNEL: &str = "/opengate/tcp-forward/1";
 pub const DESKTOP: &str = "/opengate/desktop/1";
 pub const CLIPBOARD: &str = "/opengate/clipboard/1";
+
+/// Stable categories for errors crossing an OpenGate control boundary.  The
+/// human message is deliberately separate so clients can render useful detail
+/// without having to parse implementation-specific `anyhow` text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    Protocol,
+    InvalidInput,
+    Network,
+    Timeout,
+    Pairing,
+    Authentication,
+    Authorization,
+    RateLimited,
+    FileTransfer,
+    Terminal,
+    Tunnel,
+    Service,
+    Internal,
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Protocol => "protocol",
+            Self::InvalidInput => "invalid input",
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::Pairing => "pairing",
+            Self::Authentication => "authentication",
+            Self::Authorization => "authorization",
+            Self::RateLimited => "rate limited",
+            Self::FileTransfer => "file transfer",
+            Self::Terminal => "terminal",
+            Self::Tunnel => "tunnel",
+            Self::Service => "service",
+            Self::Internal => "internal",
+        })
+    }
+}
+
+/// A typed domain error that can be wrapped in `anyhow::Error` inside a crate
+/// while retaining its category when it reaches the RPC reply boundary.
+#[derive(Debug, Clone, Error)]
+#[error("{code}: {message}")]
+pub struct OpenGateError {
+    pub code: ErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl OpenGateError {
+    pub fn new(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable,
+        }
+    }
+}
+
+fn domain_error(code: ErrorCode, message: impl Into<String>) -> anyhow::Error {
+    OpenGateError::new(code, message, false).into()
+}
+
+/// Preserve an already typed error and classify legacy errors at an RPC edge.
+/// This keeps old internal helpers source-compatible while preventing raw
+/// transport strings from becoming the public error contract.
+pub fn classify_error(error: &anyhow::Error) -> (ErrorCode, bool) {
+    for cause in error.chain() {
+        if let Some(typed) = cause.downcast_ref::<OpenGateError>() {
+            return (typed.code, typed.retryable);
+        }
+    }
+    let lower = error.to_string().to_ascii_lowercase();
+    let code = if lower.contains("rate limit") || lower.contains("too many") {
+        ErrorCode::RateLimited
+    } else if lower.contains("pair") || lower.contains("token") {
+        ErrorCode::Pairing
+    } else if lower.contains("permission")
+        || lower.contains("unauthorized")
+        || lower.contains("admin")
+        || lower.contains("trust")
+    {
+        ErrorCode::Authorization
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        ErrorCode::Timeout
+    } else if lower.contains("tunnel") || lower.contains("socks") {
+        ErrorCode::Tunnel
+    } else if lower.contains("file") || lower.contains("path") || lower.contains("checksum") {
+        ErrorCode::FileTransfer
+    } else if lower.contains("terminal") || lower.contains("shell") || lower.contains("pty") {
+        ErrorCode::Terminal
+    } else if lower.contains("invalid") || lower.contains("unsupported") {
+        ErrorCode::InvalidInput
+    } else {
+        ErrorCode::Internal
+    };
+    let retryable = error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        }) || cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    });
+    (code, retryable)
+}
 
 /// Every frame carries magic, version, message type, unique request ID and length.
 /// Type 1 is the structured CBOR envelope, whose tagged enum identifies its operation.
@@ -31,7 +150,12 @@ pub async fn write_frame_with_id<T: Serialize, W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let mut payload = Vec::new();
     ciborium::into_writer(value, &mut payload)?;
-    ensure!(payload.len() <= MAX_MESSAGE, "message exceeds size limit");
+    if payload.len() > MAX_MESSAGE {
+        return Err(domain_error(
+            ErrorCode::Protocol,
+            "message exceeds the 1 MiB size limit",
+        ));
+    }
     let mut header = [0u8; 28];
     header[..4].copy_from_slice(b"OGTE");
     header[4..6].copy_from_slice(&VERSION.to_be_bytes());
@@ -47,29 +171,47 @@ pub async fn write_frame_with_id<T: Serialize, W: AsyncWrite + Unpin>(
 pub async fn read_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(reader: &mut R) -> Result<T> {
     let mut header = [0u8; 28];
     reader.read_exact(&mut header).await?;
-    ensure!(&header[..4] == b"OGTE", "invalid OpenGate frame");
-    ensure!(
-        u16::from_be_bytes([header[4], header[5]]) == VERSION,
-        "incompatible OpenGate protocol version; upgrade required"
-    );
-    ensure!(
-        u16::from_be_bytes([header[6], header[7]]) == 1,
-        "unsupported message type"
-    );
+    if &header[..4] != b"OGTE" {
+        return Err(domain_error(
+            ErrorCode::Protocol,
+            "invalid OpenGate frame magic",
+        ));
+    }
+    let remote_version = u16::from_be_bytes([header[4], header[5]]);
+    if remote_version != VERSION {
+        return Err(domain_error(
+            ErrorCode::Protocol,
+            format!(
+                "incompatible OpenGate protocol version: local {VERSION}, remote {remote_version}; upgrade required"
+            ),
+        ));
+    }
+    if u16::from_be_bytes([header[6], header[7]]) != 1 {
+        return Err(domain_error(
+            ErrorCode::Protocol,
+            "unsupported message type",
+        ));
+    }
     let length = u32::from_be_bytes([header[24], header[25], header[26], header[27]]) as usize;
-    ensure!(
-        length > 0 && length <= MAX_MESSAGE,
-        "invalid message length"
-    );
+    if length == 0 || length > MAX_MESSAGE {
+        return Err(domain_error(ErrorCode::Protocol, "invalid message length"));
+    }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes).await?;
     // A finite cursor and ciborium's recursion limit bound malformed input work.
     let mut cursor = std::io::Cursor::new(&bytes);
-    let value = ciborium::from_reader(&mut cursor)?;
-    ensure!(
-        cursor.position() == length as u64,
-        "trailing bytes in message"
-    );
+    let value = ciborium::from_reader(&mut cursor).map_err(|error| {
+        domain_error(
+            ErrorCode::Protocol,
+            format!("invalid CBOR payload: {error}"),
+        )
+    })?;
+    if cursor.position() != length as u64 {
+        return Err(domain_error(
+            ErrorCode::Protocol,
+            "trailing bytes in message",
+        ));
+    }
     Ok(value)
 }
 
@@ -107,13 +249,20 @@ impl Permissions {
             "view-only" => Ok(Self::view_only()),
             "standard" => Ok(Self::standard()),
             "full-admin" => Ok(Self::full_admin()),
-            _ => bail!("unknown preset; use view-only, standard or full-admin"),
+            _ => Err(domain_error(
+                ErrorCode::InvalidInput,
+                "unknown preset; use view-only, standard or full-admin",
+            )),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerHello {
+    #[serde(default = "unknown_app_version")]
+    pub app_version: String,
+    #[serde(default = "current_protocol_version")]
+    pub protocol_version: u16,
     pub peer_id: String,
     #[serde(with = "serde_bytes")]
     pub public_key: Vec<u8>,
@@ -121,6 +270,12 @@ pub struct PeerHello {
     pub name: String,
     pub os: String,
     pub addresses: Vec<String>,
+}
+fn unknown_app_version() -> String {
+    "unknown (legacy v1 peer)".to_owned()
+}
+fn current_protocol_version() -> u16 {
+    VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +356,14 @@ pub struct FileEntry {
 pub enum FileReply {
     Ok,
     Error(String),
+    /// Structured file-operation failure. `Error(String)` remains readable for
+    /// peers from protocol v1 that do not know error categories.
+    Failure {
+        code: ErrorCode,
+        message: String,
+        #[serde(default)]
+        retryable: bool,
+    },
     Entries(Vec<FileEntry>),
     Metadata(FileEntry),
     Ready {
@@ -251,6 +414,8 @@ pub struct Reply {
     pub ok: bool,
     pub error: Option<String>,
     #[serde(default)]
+    pub error_code: Option<ErrorCode>,
+    #[serde(default)]
     pub retryable: bool,
     pub data: serde_json::Value,
 }
@@ -259,15 +424,20 @@ impl Reply {
         Ok(Self {
             ok: true,
             error: None,
+            error_code: None,
             retryable: false,
             data: serde_json::to_value(value)?,
         })
     }
     pub fn failure(message: impl Into<String>) -> Self {
+        Self::failure_with_code(ErrorCode::Internal, message, false)
+    }
+    pub fn failure_with_code(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
         Self {
             ok: false,
             error: Some(message.into()),
-            retryable: false,
+            error_code: Some(code),
+            retryable,
             data: serde_json::Value::Null,
         }
     }
@@ -276,41 +446,21 @@ impl Reply {
         Ok(serde_json::from_value(self.data)?)
     }
     pub fn from_error(error: &anyhow::Error) -> Self {
-        let mut reply = Self::failure(error.to_string());
-        reply.retryable = error.chain().any(|cause| {
-            cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::NotConnected
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::BrokenPipe
-                )
-            }) || cause
-                .downcast_ref::<tokio::time::error::Elapsed>()
-                .is_some()
-        });
-        reply
+        let (code, retryable) = classify_error(error);
+        Self::failure_with_code(code, error.to_string(), retryable)
     }
     pub fn check(&self) -> Result<()> {
-        if !self.ok && self.retryable {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                self.error
-                    .clone()
-                    .unwrap_or_else(|| "connection unavailable".into()),
-            )
-            .into());
+        if self.ok {
+            return Ok(());
         }
-        ensure!(
-            self.ok,
-            "{}",
-            self.error.as_deref().unwrap_or("operation rejected")
+        let error = OpenGateError::new(
+            self.error_code.unwrap_or(ErrorCode::Internal),
+            self.error
+                .clone()
+                .unwrap_or_else(|| "operation rejected".into()),
+            self.retryable,
         );
-        Ok(())
+        Err(error.into())
     }
 }
 
@@ -402,5 +552,20 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn replies_preserve_domain_code_and_retryability() {
+        let error: anyhow::Error =
+            OpenGateError::new(ErrorCode::Tunnel, "remote service is unavailable", true).into();
+        let reply = Reply::from_error(&error);
+        assert_eq!(reply.error_code, Some(ErrorCode::Tunnel));
+        assert!(reply.retryable);
+        let returned = reply.check().expect_err("failure reply must reject");
+        let typed = returned
+            .downcast_ref::<OpenGateError>()
+            .expect("reply check retains typed error");
+        assert_eq!(typed.code, ErrorCode::Tunnel);
+        assert!(typed.retryable);
     }
 }

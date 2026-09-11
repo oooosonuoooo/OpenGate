@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE32_NOPAD;
 use fs2::FileExt;
 use libp2p::{PeerId, identity};
+use opengate_protocol::{ErrorCode, OpenGateError};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -107,59 +108,65 @@ impl fmt::Debug for PairingToken {
 
 impl PairingToken {
     pub fn generate(peer_id: String, addresses: Vec<String>, ttl_seconds: u64) -> Result<Self> {
-        let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        let token = Self {
-            version: 1,
-            peer_id,
-            secret: BASE32_NOPAD.encode(&bytes),
-            expires_at: now()
-                .checked_add(ttl_seconds)
-                .ok_or_else(|| anyhow!("token expiry overflow"))?,
-            addresses,
-        };
-        token.validate(Some(ttl_seconds))?;
-        Ok(token)
+        pairing_result((|| {
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            let token = Self {
+                version: 1,
+                peer_id,
+                secret: BASE32_NOPAD.encode(&bytes),
+                expires_at: now()
+                    .checked_add(ttl_seconds)
+                    .ok_or_else(|| anyhow!("token expiry overflow"))?,
+                addresses,
+            };
+            token.validate(Some(ttl_seconds))?;
+            Ok(token)
+        })())
     }
 
     pub fn encode(&self) -> Result<String> {
-        self.validate(None)?;
-        let payload = serde_json::to_vec(self)?;
-        if payload.len() > MAX_TOKEN_LEN {
-            bail!("pairing token is too large");
-        }
-        let mut checksum = Sha256::digest(&payload)[..4].to_vec();
-        let encoded = BASE32_NOPAD.encode(&payload);
-        let check = BASE32_NOPAD.encode(&checksum.split_off(0));
-        Ok(format!("OG1-{}-{}", group(&encoded), group(&check)))
+        pairing_result((|| {
+            self.validate(None)?;
+            let payload = serde_json::to_vec(self)?;
+            if payload.len() > MAX_TOKEN_LEN {
+                bail!("pairing token is too large");
+            }
+            let mut checksum = Sha256::digest(&payload)[..4].to_vec();
+            let encoded = BASE32_NOPAD.encode(&payload);
+            let check = BASE32_NOPAD.encode(&checksum.split_off(0));
+            Ok(format!("OG1-{}-{}", group(&encoded), group(&check)))
+        })())
     }
 
     pub fn decode(input: &str) -> Result<Self> {
-        if input.len() > MAX_ENCODED_TOKEN_LEN {
-            bail!("pairing code is too long");
-        }
-        let compact: String = input
-            .chars()
-            .filter(|c| *c != '-' && !c.is_whitespace())
-            .collect();
-        let raw = compact
-            .strip_prefix("OG1")
-            .ok_or_else(|| anyhow!("invalid OpenGate pairing code prefix"))?;
-        if raw.len() < 9 || raw.len() > MAX_TOKEN_LEN * 2 {
-            bail!("invalid pairing code length");
-        }
-        let (payload_encoded, checksum_encoded) = raw.split_at(raw.len() - 7);
-        let payload = BASE32_NOPAD
-            .decode(payload_encoded.as_bytes())
-            .context("invalid pairing code")?;
-        let expected = BASE32_NOPAD.encode(&Sha256::digest(&payload)[..4]);
-        if checksum_encoded != expected {
-            bail!("pairing code checksum does not match");
-        }
-        let token: Self =
-            serde_json::from_slice(&payload).context("invalid pairing code payload")?;
-        token.validate(None)?;
-        Ok(token)
+        pairing_result((|| {
+            if input.len() > MAX_ENCODED_TOKEN_LEN {
+                bail!("pairing code is too long");
+            }
+            let compact: String = input
+                .chars()
+                .filter(|c| *c != '-' && !c.is_whitespace())
+                .collect();
+            let raw = compact
+                .strip_prefix("OG1")
+                .ok_or_else(|| anyhow!("invalid OpenGate pairing code prefix"))?;
+            if raw.len() < 9 || raw.len() > MAX_TOKEN_LEN * 2 {
+                bail!("invalid pairing code length");
+            }
+            let (payload_encoded, checksum_encoded) = raw.split_at(raw.len() - 7);
+            let payload = BASE32_NOPAD
+                .decode(payload_encoded.as_bytes())
+                .context("invalid pairing code")?;
+            let expected = BASE32_NOPAD.encode(&Sha256::digest(&payload)[..4]);
+            if checksum_encoded != expected {
+                bail!("pairing code checksum does not match");
+            }
+            let token: Self =
+                serde_json::from_slice(&payload).context("invalid pairing code payload")?;
+            token.validate(None)?;
+            Ok(token)
+        })())
     }
 
     pub fn secret_hash(&self) -> String {
@@ -207,6 +214,16 @@ impl PairingToken {
         }
         Ok(())
     }
+}
+
+fn pairing_result<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        anyhow::Error::new(OpenGateError::new(
+            ErrorCode::Pairing,
+            error.to_string(),
+            false,
+        ))
+    })
 }
 
 fn group(value: &str) -> String {

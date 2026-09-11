@@ -2,6 +2,7 @@
 //! directories, identities, or trusted-device databases.
 use anyhow::{Context, Result, anyhow, bail};
 use opengate_core::Config;
+use opengate_protocol::{ErrorCode, OpenGateError};
 use std::{ffi::OsString, path::Path, process::Command};
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +67,16 @@ pub fn linux_unit_with_mode(
 /// Installs the current executable as a service. System services need elevation;
 /// user services are managed with `systemctl --user` on Linux.
 pub fn install(executable: &Path, dir: &Path, system: bool, full_admin: bool) -> Result<()> {
+    install_impl(executable, dir, system, full_admin).map_err(|error| {
+        anyhow::Error::new(OpenGateError::new(
+            ErrorCode::Service,
+            error.to_string(),
+            false,
+        ))
+    })
+}
+
+fn install_impl(executable: &Path, dir: &Path, system: bool, full_admin: bool) -> Result<()> {
     if !executable.is_file() {
         bail!(
             "OpenGate executable does not exist: {}",
@@ -112,6 +123,16 @@ pub fn install(executable: &Path, dir: &Path, system: bool, full_admin: bool) ->
 }
 
 pub fn uninstall(system: bool) -> Result<()> {
+    uninstall_impl(system).map_err(|error| {
+        anyhow::Error::new(OpenGateError::new(
+            ErrorCode::Service,
+            error.to_string(),
+            false,
+        ))
+    })
+}
+
+fn uninstall_impl(system: bool) -> Result<()> {
     if system && !is_elevated() {
         bail!("system service removal requires elevation");
     }
@@ -293,6 +314,7 @@ fn install_windows(executable: &Path, dir: &Path, system: bool, full_admin: bool
         ]))?;
     }
     run(Command::new("sc.exe").args(["sidtype", WINDOWS_SERVICE_NAME, "unrestricted"]))?;
+    run(Command::new("sc.exe").args(["failureflag", WINDOWS_SERVICE_NAME, "1"]))?;
     run(Command::new("sc.exe").args([
         "failure",
         WINDOWS_SERVICE_NAME,
@@ -376,16 +398,26 @@ fn require_windows_system_dir(dir: &Path) -> Result<()> {
 #[cfg(windows)]
 fn stop_windows_service() -> Result<()> {
     use std::{thread, time::Duration};
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
 
     let _ = Command::new("sc.exe")
         .args(["stop", WINDOWS_SERVICE_NAME])
         .status();
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("opening the Windows Service Control Manager")?;
+    let service = manager
+        .open_service(WINDOWS_SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .context("opening the OpenGate Windows service")?;
     for _ in 0..30 {
-        let output = Command::new("sc.exe")
-            .args(["query", WINDOWS_SERVICE_NAME])
-            .output()
-            .context("querying OpenGate Windows service state")?;
-        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(": 1") {
+        if service
+            .query_status()
+            .context("querying OpenGate Windows service state")?
+            .current_state
+            == ServiceState::Stopped
+        {
             return Ok(());
         }
         thread::sleep(Duration::from_secs(1));
@@ -488,7 +520,11 @@ mod windows_dispatcher {
             arguments,
             cancellation,
         );
-        status_handle.set_service_status(status(ServiceState::Stopped))?;
+        let mut stopped = status(ServiceState::Stopped);
+        if result.is_err() {
+            stopped.exit_code = ServiceExitCode::Win32(1);
+        }
+        status_handle.set_service_status(stopped)?;
         result
     }
 }

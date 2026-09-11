@@ -2369,8 +2369,6 @@ dependencies = [
 [[package]]
 name = "libp2p-stream"
 version = "0.4.0-alpha"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d6bd8025c80205ec2810cfb28b02f362ab48a01bee32c50ab5f12761e033464"
 dependencies = [
  "futures",
  "libp2p-core",
@@ -2984,6 +2982,7 @@ dependencies = [
  "futures",
  "libp2p",
  "libp2p-stream",
+ "opengate-protocol",
  "rand 0.8.8",
  "serde",
  "tokio",
@@ -3001,6 +3000,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "uuid",
 ]
@@ -3015,6 +3015,7 @@ dependencies = [
  "hex",
  "libc",
  "libp2p",
+ "opengate-protocol",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -3032,6 +3033,7 @@ dependencies = [
  "anyhow",
  "libc",
  "opengate-core",
+ "opengate-protocol",
  "tokio-util",
  "windows-service",
  "windows-sys 0.61.2",
@@ -3055,6 +3057,7 @@ name = "opengate-tunnel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "opengate-protocol",
  "tokio",
  "tokio-util",
 ]

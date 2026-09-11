@@ -163,6 +163,14 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum DeviceCommand {
+    /// Show or change saved connection policy; this does not grant remote permissions.
+    Preferences {
+        device: String,
+        #[arg(long)]
+        auto_reconnect: Option<bool>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(5..=30))]
+        connection_timeout_seconds: Option<u64>,
+    },
     Rename {
         device: String,
         name: String,
@@ -390,7 +398,7 @@ async fn print_device_info(dir: &std::path::Path, selector: &str) -> Result<()> 
                 .find(|item| item["peer_id"].as_str() == Some(device.peer_id.as_str()))
         });
     println!(
-        "Device: {}\nDevice ID: {}\nPeer ID: {}\nOS: {}\nTrusted: {}\nStatus: {}\nObserved path: {}\nLast connected: {}\nAddresses: {}\nPermissions: {}",
+        "Device: {}\nDevice ID: {}\nPeer ID: {}\nOS: {}\nTrusted: {}\nStatus: {}\nEncrypted: {}\nAuthenticated: {}\nObserved path: {}\nTransport: {}\nLatency: {} ms\nRemote agent: {}\nPing samples: {} success / {} failure\nLast connected: {}\nAddresses: {}\nPermissions: {}",
         device.name,
         device.device_id,
         device.peer_id,
@@ -402,8 +410,32 @@ async fn print_device_info(dir: &std::path::Path, selector: &str) -> Result<()> 
             "Offline"
         },
         connection
+            .and_then(|item| item["encrypted"].as_bool())
+            .map(|value| if value { "Yes" } else { "No" })
+            .unwrap_or("Unknown"),
+        connection
+            .and_then(|item| item["identity_authenticated"].as_bool())
+            .map(|value| if value { "Yes" } else { "No" })
+            .unwrap_or("Unknown"),
+        connection
             .and_then(|item| item["path"].as_str())
             .unwrap_or("—"),
+        connection
+            .and_then(|item| item["transport"].as_str())
+            .unwrap_or("—"),
+        connection
+            .and_then(|item| item["latency_ms"].as_u64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "—".into()),
+        connection
+            .and_then(|item| item["remote_agent"].as_str())
+            .unwrap_or("—"),
+        connection
+            .and_then(|item| item["ping_successes"].as_u64())
+            .unwrap_or(0),
+        connection
+            .and_then(|item| item["ping_failures"].as_u64())
+            .unwrap_or(0),
         device
             .last_connected
             .map(|value| value.to_string())
@@ -557,6 +589,22 @@ async fn execute(dir: PathBuf, command: Command) -> Result<()> {
             Ok(())
         }
         Command::Device { command } => match command {
+            DeviceCommand::Preferences {
+                device,
+                auto_reconnect,
+                connection_timeout_seconds,
+            } => print(
+                client::rpc(
+                    &dir,
+                    LocalCommand::ConnectionPreferences {
+                        device,
+                        auto_reconnect,
+                        connection_timeout_seconds,
+                    },
+                )
+                .await?
+                .data,
+            ),
             DeviceCommand::Rename { device, name } => print(
                 client::rpc(&dir, LocalCommand::Rename { device, name })
                     .await?
@@ -737,9 +785,7 @@ async fn execute(dir: PathBuf, command: Command) -> Result<()> {
             .await
         }
         Command::Clipboard { device, mode } => clipboard::run(dir, device, &mode).await,
-        Command::Diagnose { device } => {
-            print(diagnostics::run(&dir, device).await?)
-        }
+        Command::Diagnose { device } => print(diagnostics::run(&dir, device).await?),
         Command::Scan { seconds } => {
             client::ensure_daemon(&dir).await?;
             tokio::time::sleep(std::time::Duration::from_secs(seconds.min(30))).await;

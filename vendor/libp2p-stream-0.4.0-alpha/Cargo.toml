@@ -12,20 +12,16 @@
 [package]
 edition = "2021"
 rust-version = "1.83.0"
-name = "libp2p-relay"
-version = "0.21.1"
-authors = [
-    "Parity Technologies <admin@parity.io>",
-    "Max Inden <mail@max-inden.de>",
-]
+name = "libp2p-stream"
+version = "0.4.0-alpha"
 build = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Communications relaying for libp2p"
-readme = false
+description = "Generic stream protocols for libp2p"
+readme = "README.md"
 keywords = [
     "peer-to-peer",
     "libp2p",
@@ -38,94 +34,39 @@ categories = [
 license = "MIT"
 repository = "https://github.com/libp2p/rust-libp2p"
 
-[package.metadata.docs.rs]
-all-features = true
-
 [lib]
-name = "libp2p_relay"
+name = "libp2p_stream"
 path = "src/lib.rs"
 
 [[test]]
 name = "lib"
 path = "tests/lib.rs"
 
-[dependencies.asynchronous-codec]
-version = "0.7.0"
-
-[dependencies.bytes]
-version = "1"
-
-[dependencies.either]
-version = "1.12.0"
-
 [dependencies.futures]
-version = "0.3.30"
-
-[dependencies.futures-bounded]
-version = "0.2.4"
-
-[dependencies.futures-timer]
-version = "3"
+version = "0.3.32"
 
 [dependencies.libp2p-core]
-version = "0.43.2"
+version = "0.43.1"
 
 [dependencies.libp2p-identity]
-version = "0.2.13"
+version = "0.2.12"
+features = ["peerid"]
 
 [dependencies.libp2p-swarm]
-version = "0.47.1"
-
-[dependencies.quick-protobuf]
-version = "0.8"
-
-[dependencies.quick-protobuf-codec]
-version = "0.3.1"
+version = "0.47.0"
 
 [dependencies.rand]
-version = "0.8.4"
-
-[dependencies.static_assertions]
-version = "1"
-
-[dependencies.thiserror]
-version = "2"
+version = "0.8"
 
 [dependencies.tracing]
 version = "0.1.41"
 
-[dependencies.web-time]
-version = "1.1.0"
-
-[dev-dependencies.libp2p-identity]
-version = "0.2.13"
-features = ["rand"]
-
-[dev-dependencies.libp2p-ping]
-version = "0.47.0"
-
-[dev-dependencies.libp2p-plaintext]
-version = "0.43.0"
-
-[dev-dependencies.libp2p-swarm]
-version = "0.47.1"
-features = [
-    "macros",
-    "tokio",
-]
-
 [dev-dependencies.libp2p-swarm-test]
 version = "0.6.0"
 
-[dev-dependencies.libp2p-yamux]
-version = "0.47.0"
-
 [dev-dependencies.tokio]
 version = "1.38"
-features = [
-    "macros",
-    "rt-multi-thread",
-]
+features = ["full"]
 default-features = false
 
 [dev-dependencies.tracing-subscriber]
@@ -145,6 +86,3 @@ priority = -1
 
 [lints.rust]
 unreachable_pub = "warn"
-
-[dev-dependencies.quickcheck]
-version = "1"
