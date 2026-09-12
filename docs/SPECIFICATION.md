@@ -38,9 +38,8 @@ When the owner selects:
 
 **Allow Access**
 
-OpenGate generates a temporary pairing token such as:
-
-OG1-X7KM-92HD-KQ8P-4FZT
+OpenGate generates a temporary pairing token beginning with `OG1-` and
+followed by random one-time groups.
 
 The interface should show:
 
