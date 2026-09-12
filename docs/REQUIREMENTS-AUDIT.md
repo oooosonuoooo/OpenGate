@@ -13,14 +13,15 @@ source is present but a material validation boundary or deliverable remains.
 **Design-only** is deliberate future or optional scope, recorded separately from
 a required-core gap.
 
-The final evidence set is cargo fmt --check, locked workspace clippy, 42
+The local evidence set is cargo fmt --check, locked workspace clippy, 43
 passing locked workspace tests, cargo audit exit 0, the Linux release build,
 a Windows x86_64 GNU release cross-build, final DEB/RPM/portable/ZIP/MSI
 artifacts with SHA256SUMS, final TUI and Linux user-service checks, and the
-isolated namespace network-loss tests. The final current-binary default network
-run is in target/validation/network-interruption-final.log; the exact-tree 2 GiB + 17
-byte acceptance is in target/validation/network-interruption-final-large.log. Physical Windows, reboot, restrictive
-NAT/CGNAT and Linux-to-Windows acceptance are called out explicitly below.
+isolated namespace network-loss tests. Generated evidence paths under
+`target/validation/` are intentionally ignored and are not included in a
+GitHub checkout; the commands in DEVELOPMENT.md and docs/NETWORK-TESTS.md
+reproduce the checks. Physical Windows, reboot, restrictive NAT/CGNAT and
+Linux-to-Windows acceptance are called out explicitly below.
 
 ## Remaining physical acceptance before a production claim
 

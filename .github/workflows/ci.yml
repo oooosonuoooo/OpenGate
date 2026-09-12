@@ -21,8 +21,15 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
       - run: cargo build --locked --workspace --release
-      - run: cargo install cargo-audit --locked && cargo audit
-      - run: scripts/package-linux.sh 0.1.0 target/release/opengate
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
+      - name: Package Linux artifacts
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          scripts/package-linux.sh "$version" target/release/opengate
       - uses: actions/upload-artifact@v4
         with: { name: opengate-linux-deb, path: target/packages/*.deb }
   rpm:
@@ -41,7 +48,11 @@ jobs:
           key: ${{ runner.os }}-${{ github.job }}-cargo-downloads-${{ hashFiles('Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --locked --workspace --release
-      - run: scripts/package-linux.sh 0.1.0 target/release/opengate
+      - name: Package Linux artifacts
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          scripts/package-linux.sh "$version" target/release/opengate
       - uses: actions/upload-artifact@v4
         with: { name: opengate-linux-rpm, path: target/packages/*.rpm }
   windows:
@@ -62,11 +73,21 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
       - run: cargo build --locked --workspace --release
-      - run: cargo install cargo-audit --locked; cargo audit
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
       - run: dotnet tool install --global wix --version 4.*
       - shell: pwsh
         run: wix extension add WixToolset.Util.wixext
+      - name: Read package version
+        id: package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'Could not determine package version from Cargo.toml.' }
+          "version=$version" >> $env:GITHUB_OUTPUT
       - shell: pwsh
-        run: wix build -arch x64 packaging/windows/OpenGate.wxs -ext WixToolset.Util.wixext -d OpenGateBinary="$PWD/target/release/opengate.exe" -d ProductVersion="0.1.0" -o target/OpenGate.msi
+        run: wix build -arch x64 packaging/windows/OpenGate.wxs -ext WixToolset.Util.wixext -d OpenGateBinary="$PWD/target/release/opengate.exe" -d ProductVersion="${{ steps.package.outputs.version }}" -o target/OpenGate.msi
       - uses: actions/upload-artifact@v4
         with: { name: opengate-windows-msi, path: target/OpenGate.msi }

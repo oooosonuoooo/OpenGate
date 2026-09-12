@@ -19,13 +19,20 @@ or invitation. Success requires a zero CLI exit, no checkpoint regression, and
 matching destination size and complete SHA-256. Test tokens remain in memory;
 private temporary state and all child processes are removed on exit.
 
-The final current-binary default run transferred 134,217,728 bytes, detected
-the outage after 67,502,080 bytes, retained a 67,567,616-byte durable
-checkpoint, automatically reconnected and resumed to a matching SHA-256. Its
-evidence is `target/validation/network-interruption-final.log` with exit code
-`0`. The final current-binary 2 GiB + 17 byte run used the same harness and
-completed with the same resume and checksum assertions. Its evidence is
-`target/validation/network-interruption-final-large.log` with exit code `0`.
+Generated build and test output under `target/` is ignored and is not included
+in a GitHub checkout. To retain a local transcript, create the directory and
+pipe the run through `tee`:
+
+```console
+mkdir -p target/validation
+python3 scripts/test-network-interruption.py 2>&1 \
+  | tee target/validation/network-interruption.log
+```
+
+A successful current-binary run reports a 128 MiB transfer, a durable
+checkpoint retained during 100% loss, automatic saved-peer reconnect, resumed
+completion, and a matching SHA-256. Add `--large` to repeat the 2 GiB + 17
+byte case.
 
 This is actual controlled Linux packet loss and recovery. It does not establish
 Windows interoperability, a physical router restart, sleep/wake behavior,
