@@ -80,20 +80,26 @@ where
             .kill();
         Ok(())
     }));
+    let (cursor_query_tx, mut cursor_query_rx) = mpsc::channel::<usize>(QUEUE);
     let output = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut reader = reader;
         let mut buffer = [0u8; 8192];
+        let mut pending = Vec::new();
         loop {
             let n = reader.read(&mut buffer)?;
             if n == 0 {
                 break;
             }
-            if out_tx
-                .blocking_send(TerminalFrame::Output(buffer[..n].to_vec()))
-                .is_err()
-            {
+            let (bytes, cursor_queries) = filter_cursor_queries(&buffer[..n], &mut pending);
+            if cursor_queries > 0 && cursor_query_tx.blocking_send(cursor_queries).is_err() {
                 break;
             }
+            if !bytes.is_empty() && out_tx.blocking_send(TerminalFrame::Output(bytes)).is_err() {
+                break;
+            }
+        }
+        if !pending.is_empty() {
+            let _ = out_tx.blocking_send(TerminalFrame::Output(pending));
         }
         Ok(())
     });
@@ -104,6 +110,7 @@ where
         let _ = exit_sender.blocking_send(status.map(|s| s.exit_code()));
     });
     let mut output_done = false;
+    let mut cursor_query_done = false;
     let mut exit_code = None;
     loop {
         if output_done && let Some(code) = exit_code {
@@ -123,6 +130,24 @@ where
                 _ => break,
             },
             outbound=out_rx.recv(), if !output_done => match outbound { Some(frame)=>write_frame(&mut output_w,&frame).await?, None=>output_done=true },
+            cursor_queries=cursor_query_rx.recv(), if !cursor_query_done => match cursor_queries {
+                Some(count) => {
+                    // portable-pty enables PSEUDOCONSOLE_INHERIT_CURSOR. ConPTY
+                    // emits ESC[6n and will not process shell input until the
+                    // host answers with the current cursor position.
+                    for _ in 0..count {
+                        if let Some(sender) = control_tx.as_ref()
+                            && sender
+                                .send(TerminalFrame::Input(b"\x1b[1;1R".to_vec()))
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                None => cursor_query_done=true,
+            },
             status=exit_receiver.recv(), if exit_code.is_none()=> {
                 exit_code=Some(status.ok_or_else(||anyhow!("terminal exit waiter stopped"))??);
                 // ConPTY may keep its output pipe open until the pseudo-console
@@ -147,6 +172,28 @@ where
     }
     let _ = output.await;
     Ok(())
+}
+
+fn filter_cursor_queries(bytes: &[u8], pending: &mut Vec<u8>) -> (Vec<u8>, usize) {
+    const QUERY: &[u8] = b"\x1b[6n";
+    pending.extend_from_slice(bytes);
+    let mut visible = Vec::with_capacity(pending.len());
+    let mut consumed = 0;
+    let mut queries = 0;
+    while consumed < pending.len() {
+        let remaining = &pending[consumed..];
+        if remaining.starts_with(QUERY) {
+            queries += 1;
+            consumed += QUERY.len();
+        } else if QUERY.starts_with(remaining) {
+            break;
+        } else {
+            visible.push(remaining[0]);
+            consumed += 1;
+        }
+    }
+    pending.drain(..consumed);
+    (visible, queries)
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -370,5 +417,17 @@ mod tests {
         cancel.cancel();
         timeout(Duration::from_secs(3), task).await???;
         Ok(())
+    }
+
+    #[test]
+    fn filters_split_conpty_cursor_query() {
+        let mut pending = Vec::new();
+        let (visible, queries) = filter_cursor_queries(b"before\x1b[", &mut pending);
+        assert_eq!(visible, b"before");
+        assert_eq!(queries, 0);
+        let (visible, queries) = filter_cursor_queries(b"6nafter", &mut pending);
+        assert_eq!(visible, b"after");
+        assert_eq!(queries, 1);
+        assert!(pending.is_empty());
     }
 }
