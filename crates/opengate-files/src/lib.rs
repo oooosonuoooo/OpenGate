@@ -901,32 +901,53 @@ fn open_local_new(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 fn open_local_existing(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
-    #[cfg(windows)]
-    {
-        let _ = (path, write);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "resuming local transfer state is unsupported on Windows until a no-reparse-point open is available",
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(write);
-        no_follow(&mut options);
-        let file = options.open(path)?;
-        ensure_regular(&file)?;
-        Ok(file)
-    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(write);
+    no_follow(&mut options);
+    let file = options.open(path)?;
+    ensure_regular(&file)?;
+    Ok(file)
 }
 #[cfg(unix)]
 fn no_follow(options: &mut std::fs::OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
     options.custom_flags(libc::O_NOFOLLOW);
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn no_follow(options: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+#[cfg(all(not(unix), not(windows)))]
 fn no_follow(_options: &mut std::fs::OpenOptions) {}
 fn ensure_regular(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::{mem::size_of, os::windows::io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo,
+            GetFileInformationByHandleEx,
+        };
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileAttributeTagInfo,
+                (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "local transfer state must not be a reparse point",
+            ));
+        }
+    }
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
