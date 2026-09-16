@@ -36,4 +36,8 @@ This is not a claim of independent security certification. Unverified operating-
 
 ## Reporting a vulnerability
 
-A security contact has not yet been configured for this unpublished project. Contact the repository owner privately and agree on an encrypted reporting channel before sending exploit details. Include affected version, platform, impact, a minimal reproduction and any mitigations. Do not include keys, tokens or personal files. The repository must configure a private reporting contact before public release.
+Report suspected vulnerabilities privately through GitHub's private vulnerability reporting form:
+
+https://github.com/oooosonuoooo/OpenGate/security/advisories/new
+
+Do not open a public issue or include exploit details in public commits. Include the affected version, platform, impact, minimal reproduction and any mitigations. Do not include keys, tokens, credentials or personal files. If the form is unavailable, contact @oooosonuoooo through GitHub and request an encrypted reporting channel before sending sensitive details.
