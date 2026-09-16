@@ -58,7 +58,7 @@ where
     let local_cancel = cancel.child_token();
     let cancel_control = local_cancel.clone();
     let killer_control = killer.clone();
-    let control = tokio::task::spawn_blocking(move || -> Result<()> {
+    let mut control = Some(tokio::task::spawn_blocking(move || -> Result<()> {
         let mut writer = writer;
         while let Some(frame) = control_rx.blocking_recv() {
             match frame {
@@ -79,7 +79,7 @@ where
             .map_err(|_| anyhow!("terminal killer poisoned"))?
             .kill();
         Ok(())
-    });
+    }));
     let output = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut reader = reader;
         let mut buffer = [0u8; 8192];
@@ -130,12 +130,21 @@ where
                 // as the child exits so output can reach EOF and the Exit frame
                 // can be delivered on Windows as well as Unix.
                 control_tx = None;
+                if let Some(task) = control.take() {
+                    // Awaiting the control task here is important on ConPTY:
+                    // dropping its master handle is what lets the output
+                    // reader observe EOF. Waiting until after the output
+                    // reader finishes would deadlock the two tasks.
+                    let _ = task.await;
+                }
             },
         }
     }
     drop(control_tx);
     local_cancel.cancel();
-    let _ = control.await;
+    if let Some(task) = control {
+        let _ = task.await;
+    }
     let _ = output.await;
     Ok(())
 }
