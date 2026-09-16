@@ -53,6 +53,7 @@ where
     });
     let _reader_guard = AbortOnDrop(reader_task);
     let (control_tx, mut control_rx) = mpsc::channel::<TerminalFrame>(QUEUE);
+    let mut control_tx = Some(control_tx);
     let (out_tx, mut out_rx) = mpsc::channel::<TerminalFrame>(QUEUE);
     let local_cancel = cancel.child_token();
     let cancel_control = local_cancel.clone();
@@ -112,11 +113,24 @@ where
         tokio::select! {
             _=cancel.cancelled()=>{break},
             frame=incoming_rx.recv() => match frame {
-                Some(frame @ (TerminalFrame::Input(_) | TerminalFrame::Resize { .. } | TerminalFrame::Close)) => { if control_tx.send(frame).await.is_err(){break} },
+                Some(frame @ (TerminalFrame::Input(_) | TerminalFrame::Resize { .. } | TerminalFrame::Close)) => {
+                    if let Some(sender) = control_tx.as_ref()
+                        && sender.send(frame).await.is_err()
+                    {
+                        break
+                    }
+                },
                 _ => break,
             },
             outbound=out_rx.recv(), if !output_done => match outbound { Some(frame)=>write_frame(&mut output_w,&frame).await?, None=>output_done=true },
-            status=exit_receiver.recv(), if exit_code.is_none()=> { exit_code=Some(status.ok_or_else(||anyhow!("terminal exit waiter stopped"))??); },
+            status=exit_receiver.recv(), if exit_code.is_none()=> {
+                exit_code=Some(status.ok_or_else(||anyhow!("terminal exit waiter stopped"))??);
+                // ConPTY may keep its output pipe open until the pseudo-console
+                // control handle is released. Close the control sender as soon
+                // as the child exits so output can reach EOF and the Exit frame
+                // can be delivered on Windows as well as Unix.
+                control_tx = None;
+            },
         }
     }
     drop(control_tx);
