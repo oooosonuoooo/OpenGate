@@ -225,6 +225,10 @@ async fn pair_shell_files_forward_restart_and_revoke() -> Result<()> {
             .await?;
     }
     // Interactive programs run through a PTY, not a pre-canned command response.
+    let trace = std::env::var_os("OPENGATE_E2E_TRACE").is_some();
+    if trace {
+        eprintln!("e2e: opening shell");
+    }
     let mut shell = a
         .open(&b_id, RemoteRequest::Shell(ShellRequest::default()))
         .await?;
@@ -241,12 +245,25 @@ async fn pair_shell_files_forward_restart_and_revoke() -> Result<()> {
     #[cfg(not(windows))]
     let command = b"printf 'OPENGATE_PTY_VERIFIED\\n'\nexit\n".to_vec();
     write_frame(&mut shell, &TerminalFrame::Input(command)).await?;
+    if trace {
+        eprintln!("e2e: shell input sent");
+    }
     let mut output = Vec::new();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match read_frame::<TerminalFrame, _>(&mut shell).await? {
-                TerminalFrame::Output(bytes) => output.extend(bytes),
-                TerminalFrame::Exit { .. } => break,
+                TerminalFrame::Output(bytes) => {
+                    if trace {
+                        eprintln!("e2e: shell output frame {} bytes", bytes.len());
+                    }
+                    output.extend(bytes)
+                }
+                TerminalFrame::Exit { code } => {
+                    if trace {
+                        eprintln!("e2e: shell exit frame code {code}");
+                    }
+                    break;
+                }
                 _ => {}
             }
         }
