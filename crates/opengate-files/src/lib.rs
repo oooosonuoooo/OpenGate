@@ -844,8 +844,9 @@ fn reject_local_symlink(path: &Path) -> Result<()> {
 }
 /// The durable download state lives next to the requested destination.  On Unix
 /// every open uses `O_NOFOLLOW`, so a swap to a symlink between validation and
-/// opening is rejected by the kernel.  Windows has no equivalent portable std API;
-/// create-new is safe there, while existing state is refused rather than followed.
+/// opening is rejected by the kernel.  On Windows, create-new is safe because a
+/// preexisting path makes the operation fail; existing state is opened with
+/// `FILE_FLAG_OPEN_REPARSE_POINT` and then rejected if it is a reparse point.
 fn read_local_state(path: &Path) -> Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -895,6 +896,7 @@ fn open_local_part_existing(path: &Path) -> Result<std::fs::File> {
 fn open_local_new(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
     no_follow(&mut options);
     let file = options.open(path)?;
     ensure_regular(&file)?;
