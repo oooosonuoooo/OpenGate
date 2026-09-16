@@ -904,10 +904,10 @@ fn open_local_existing(path: &Path, write: bool) -> std::io::Result<std::fs::Fil
     #[cfg(windows)]
     {
         let _ = (path, write);
-        return Err(std::io::Error::new(
+        Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "resuming local transfer state is unsupported on Windows until a no-reparse-point open is available",
-        ));
+        ))
     }
     #[cfg(not(windows))]
     {
