@@ -245,13 +245,13 @@ The runtime itself needs only Python. If you prefer a single executable, the sup
 Linux:
 
 ```bash
-./scripts/build-standalone.sh
+./legacy/python/build-standalone.sh
 ```
 
 Windows:
 
 ```powershell
-.\scripts\build-standalone-windows.ps1
+.\legacy\python\build-standalone-windows.ps1
 ```
 
 # Current security notes

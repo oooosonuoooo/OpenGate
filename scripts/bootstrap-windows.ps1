@@ -40,14 +40,16 @@ if (-not $Apply) {
   exit 0
 }
 
-if (-not $cargo) {
+if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
   $rustup = Join-Path $env:TEMP 'rustup-init.exe'
   Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -OutFile $rustup
-  & $rustup -y --profile minimal
+  & $rustup -y --profile minimal --default-toolchain 1.98.1
   if ($LASTEXITCODE -ne 0) { throw "rustup installation failed ($LASTEXITCODE)" }
   $env:PATH = (Join-Path $env:USERPROFILE '.cargo\bin') + ';' + $env:PATH
-  $cargo = Get-Command cargo -ErrorAction SilentlyContinue
-  if (-not $cargo) { throw 'Rust installed, but cargo is not available in this session. Open a new PowerShell window and rerun the bootstrap.' }
+}
+$cargo = Get-Command cargo -ErrorAction SilentlyContinue
+if (-not $cargo) {
+  throw 'Rust installed, but cargo is not available in this session. Open a new PowerShell window and rerun the bootstrap.'
 }
 
 if (-not $devCmd) {
@@ -72,8 +74,8 @@ if ($InstallOpenSshServer) {
 }
 
 if (Get-Command rustup -ErrorAction SilentlyContinue) {
-  & rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-  if ($LASTEXITCODE -ne 0) { throw 'Rust stable toolchain setup failed.' }
+  & rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+  if ($LASTEXITCODE -ne 0) { throw 'Rust 1.98.1 toolchain setup failed.' }
 }
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
   $winget = Get-Command winget -ErrorAction SilentlyContinue
@@ -89,11 +91,11 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $repo
 try {
   if (Get-Command rustup -ErrorAction SilentlyContinue) {
-    Invoke-MsvcCommand $devCmd 'cargo +stable build --locked --release && cargo +stable test --locked --workspace'
+    Invoke-MsvcCommand $devCmd 'cargo +1.98.1 build --locked --release && cargo +1.98.1 test --locked --workspace'
   } else {
     Invoke-MsvcCommand $devCmd 'cargo build --locked --release && cargo test --locked --workspace'
   }
-  & dotnet tool update --global wix --version '4.*'
+  & dotnet tool update --global wix --version '4.0.6'
   if ($LASTEXITCODE -ne 0) { throw "WiX installation failed ($LASTEXITCODE)" }
   $wix = Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe'
   if (-not (Test-Path -LiteralPath $wix -PathType Leaf)) { throw "WiX executable not found: $wix" }

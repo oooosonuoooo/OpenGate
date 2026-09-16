@@ -14,7 +14,7 @@ done
 case "$MODE" in host|controller|both) ;; *) echo "--mode must be host, controller, or both" >&2; exit 2;; esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE="$SCRIPT_DIR/../opengate.py"
+SOURCE="$SCRIPT_DIR/opengate.py"
 
 SUDO=""
 if [[ $EUID -ne 0 ]]; then SUDO="sudo"; fi

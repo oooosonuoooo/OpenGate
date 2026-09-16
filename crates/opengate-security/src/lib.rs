@@ -469,7 +469,7 @@ fn dpapi(input: &[u8], protect: bool, machine: bool) -> Result<Vec<u8>> {
     let ok = unsafe {
         if protect {
             CryptProtectData(
-                &mut input_blob,
+                &input_blob,
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
@@ -479,7 +479,7 @@ fn dpapi(input: &[u8], protect: bool, machine: bool) -> Result<Vec<u8>> {
             )
         } else {
             CryptUnprotectData(
-                &mut input_blob,
+                &input_blob,
                 std::ptr::null_mut(),
                 std::ptr::null(),
                 std::ptr::null(),

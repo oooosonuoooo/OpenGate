@@ -2,7 +2,7 @@ Name: opengate
 Version: %{version}
 Release: 1%{?dist}
 Summary: Secure peer-to-peer remote access daemon
-License: Apache-2.0
+License: MIT
 Requires(pre): shadow-utils
 Requires(post): systemd
 Source0: opengate.service

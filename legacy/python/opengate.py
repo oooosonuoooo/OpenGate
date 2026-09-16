@@ -44,6 +44,7 @@ DEFAULT_PORT = 44344
 DEFAULT_LOCAL_PORT = 2222
 DEFAULT_SSH_TARGET = "127.0.0.1:22"
 MAX_JSON = 64 * 1024
+MAX_CONNECTION_WORKERS = 128
 CONFIG_LOCK = threading.RLock()
 
 
@@ -398,7 +399,13 @@ def host_handshake(conn: socket.socket, system: bool) -> Dict[str, Any]:
     raise OpenGateError("Unsupported authentication mode")
 
 
-def handle_host_connection(conn: socket.socket, addr: Tuple[Any, ...], system: bool, target: Tuple[str, int]) -> None:
+def handle_host_connection(
+    conn: socket.socket,
+    addr: Tuple[Any, ...],
+    system: bool,
+    target: Tuple[str, int],
+    workers: threading.BoundedSemaphore,
+) -> None:
     try:
         conn.settimeout(15)
         auth = host_handshake(conn, system)
@@ -416,6 +423,7 @@ def handle_host_connection(conn: socket.socket, addr: Tuple[Any, ...], system: b
             pass
         print(f"[{dt.datetime.now().isoformat(timespec='seconds')}] Connection from {addr} rejected/ended: {exc}", file=sys.stderr)
     finally:
+        workers.release()
         try:
             conn.close()
         except OSError:
@@ -436,12 +444,16 @@ def run_host(bind_text: str, target_text: str, system: bool) -> None:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((host, port))
     listener.listen(128)
+    workers = threading.BoundedSemaphore(MAX_CONNECTION_WORKERS)
     try:
         while True:
             conn, addr = listener.accept()
+            if not workers.acquire(blocking=False):
+                conn.close()
+                continue
             t = threading.Thread(
                 target=handle_host_connection,
-                args=(conn, addr, system, target),
+                args=(conn, addr, system, target, workers),
                 daemon=True,
             )
             t.start()
@@ -580,13 +592,21 @@ def open_authenticated_tunnel(device_name: str, record: Dict[str, Any]) -> socke
     raise OpenGateError("No saved address is reachable. " + " | ".join(errors))
 
 
-def handle_local_connection(local: socket.socket, addr: Tuple[Any, ...], device_name: str, record: Dict[str, Any], retry_seconds: int) -> None:
+def handle_local_connection(
+    local: socket.socket,
+    addr: Tuple[Any, ...],
+    device_name: str,
+    record: Dict[str, Any],
+    retry_seconds: int,
+    workers: threading.BoundedSemaphore,
+) -> None:
     deadline = time.time() + max(0, retry_seconds)
     delay = 1.0
     while True:
         try:
             remote = open_authenticated_tunnel(device_name, record)
             relay_bidirectional(local, remote)
+            workers.release()
             return
         except Exception as exc:
             if time.time() >= deadline:
@@ -595,6 +615,7 @@ def handle_local_connection(local: socket.socket, addr: Tuple[Any, ...], device_
                     local.close()
                 except OSError:
                     pass
+                workers.release()
                 return
             time.sleep(delay)
             delay = min(delay * 1.7, 8.0)
@@ -613,12 +634,16 @@ def run_controller(device_name: str, listen_text: str, retry_seconds: int) -> No
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((host, port))
     listener.listen(64)
+    workers = threading.BoundedSemaphore(MAX_CONNECTION_WORKERS)
     try:
         while True:
             local, addr = listener.accept()
+            if not workers.acquire(blocking=False):
+                local.close()
+                continue
             t = threading.Thread(
                 target=handle_local_connection,
-                args=(local, addr, device_name, record, retry_seconds),
+                args=(local, addr, device_name, record, retry_seconds, workers),
                 daemon=True,
             )
             t.start()

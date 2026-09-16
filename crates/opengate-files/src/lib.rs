@@ -3,6 +3,7 @@
 use std::{
     io::{Read, SeekFrom, Write},
     path::{Component, Path, PathBuf},
+    sync::Mutex,
     time::UNIX_EPOCH,
 };
 
@@ -20,6 +21,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
 const PART_PREFIX: &str = ".opengate-upload-";
+const MAX_UPLOAD_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_STAGED_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_STAGED_UPLOADS: usize = 1024;
+static UPLOAD_QUOTA_LOCK: Mutex<()> = Mutex::new(());
 
 /// A durable byte position reported after each accepted transfer chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,6 +421,10 @@ where
         is_hash(expected),
         "upload checksum must be a SHA-256 hex digest"
     );
+    ensure!(
+        size <= MAX_UPLOAD_SIZE,
+        "upload exceeds the configured per-file limit"
+    );
     let dest = checked(root, raw, true)?;
     let identity = staging_identity(peer, &dest, size, expected);
     let stage = PathBuf::from(format!("{PART_PREFIX}{identity}.part"));
@@ -424,7 +433,12 @@ where
         "peer={peer}\npath={}\nsize={size}\nsha256={expected}\n",
         dest.display()
     );
+    let _quota_guard = UPLOAD_QUOTA_LOCK
+        .lock()
+        .map_err(|_| anyhow!("upload quota lock was poisoned"))?;
+    enforce_staged_quota(root, &stage, &checkpoint, size)?;
     let offset = prepare_stage(root, &stage, &checkpoint, &checkpoint_contents, size)?;
+    drop(_quota_guard);
     write_frame(
         stream,
         &FileReply::Ready {
@@ -703,6 +717,66 @@ fn prepare_stage(
     f.sync_all()?;
     Ok(n)
 }
+
+fn enforce_staged_quota(root: &Dir, stage: &Path, checkpoint: &Path, size: u64) -> Result<()> {
+    use std::collections::HashSet;
+
+    let mut staged = 0_u64;
+    let mut active_uploads = HashSet::new();
+    let mut reservations = HashSet::new();
+    for entry in root.read_dir(".")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(PART_PREFIX) || !name.ends_with(".state") {
+            continue;
+        }
+        let identity = name.trim_end_matches(".state").to_owned();
+        active_uploads.insert(identity.clone());
+        let path = PathBuf::from(name.as_ref());
+        if path != *checkpoint
+            && let Ok(contents) = root.read_to_string(&path)
+            && let Some(value) = contents
+                .lines()
+                .find_map(|line| line.strip_prefix("size=")?.parse::<u64>().ok())
+        {
+            staged = staged.saturating_add(value);
+            reservations.insert(name.trim_end_matches(".state").to_owned());
+        }
+    }
+    for entry in root.read_dir(".")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(PART_PREFIX) && name.ends_with(".part") {
+            let identity = name.trim_end_matches(".part");
+            active_uploads.insert(identity.to_owned());
+            if !reservations.contains(identity) {
+                staged = staged.saturating_add(entry.metadata()?.len());
+            }
+        }
+    }
+    let current_identity = checkpoint
+        .to_string_lossy()
+        .trim_end_matches(".state")
+        .to_owned();
+    ensure!(
+        active_uploads.len() + usize::from(!active_uploads.contains(&current_identity))
+            <= MAX_STAGED_UPLOADS,
+        "too many staged uploads"
+    );
+    // A retry reuses its own reservation instead of counting it twice.
+    if let Ok(file) = root.open(stage)
+        && let Ok(metadata) = file.metadata()
+    {
+        staged = staged.saturating_sub(metadata.len());
+    }
+    ensure!(
+        staged.saturating_add(size) <= MAX_STAGED_BYTES,
+        "staged uploads exceed the configured storage quota"
+    );
+    Ok(())
+}
 fn write_checkpoint(root: &Dir, path: &Path, contents: &str) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -935,6 +1009,49 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_upload_quota_counts_persistent_reservations() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Dir::open_ambient_dir(temp.path(), ambient_authority())?;
+        root.write(
+            ".opengate-upload-existing.state",
+            format!("peer=test\npath=file\nsize={MAX_STAGED_BYTES}\nsha256=\n"),
+        )?;
+        assert!(
+            enforce_staged_quota(
+                &root,
+                Path::new(".opengate-upload-new.part"),
+                Path::new(".opengate-upload-new.state"),
+                1,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_upload_quota_counts_abandoned_uploads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Dir::open_ambient_dir(temp.path(), ambient_authority())?;
+        for index in 0..MAX_STAGED_UPLOADS {
+            root.write(
+                format!("{PART_PREFIX}abandoned-{index}.state"),
+                "peer=test\npath=file\nsize=0\nsha256=\n",
+            )?;
+        }
+        assert!(
+            enforce_staged_quota(
+                &root,
+                Path::new(".opengate-upload-new.part"),
+                Path::new(".opengate-upload-new.state"),
+                0,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn rejects_escape_and_symlink() {
         let temp = tempfile::tempdir().unwrap();

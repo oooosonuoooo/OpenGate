@@ -3,6 +3,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use opengate_core::Config;
 use opengate_protocol::{ErrorCode, OpenGateError};
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::{ffi::OsString, path::Path, process::Command};
 use tokio_util::sync::CancellationToken;
 
@@ -88,6 +90,9 @@ fn install_impl(executable: &Path, dir: &Path, system: bool, full_admin: bool) -
             "system service installation requires elevation; use the platform installer or run from an elevated administrator shell"
         );
     }
+    if system {
+        require_trusted_system_executable(executable)?;
+    }
     #[cfg(windows)]
     if system {
         require_windows_system_dir(dir)?;
@@ -120,6 +125,69 @@ fn install_impl(executable: &Path, dir: &Path, system: bool, full_admin: bool) -
     {
         bail!("service installation is currently supported on Linux and Windows")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn require_trusted_system_executable(executable: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let actual = executable
+        .canonicalize()
+        .with_context(|| format!("canonicalizing system executable {}", executable.display()))?;
+    let allowed = [
+        Path::new("/usr/bin/opengate"),
+        Path::new("/usr/local/bin/opengate"),
+    ];
+    if !allowed.iter().any(|path| actual == *path) {
+        bail!(
+            "system services require the installed OpenGate executable at /usr/bin/opengate or /usr/local/bin/opengate"
+        );
+    }
+    let file = std::fs::metadata(&actual)?;
+    if file.uid() != 0 || file.mode() & 0o022 != 0 {
+        bail!("system executable must be root-owned and not writable by group or other users");
+    }
+    let mut parent = actual.parent();
+    while let Some(path) = parent {
+        let metadata = std::fs::metadata(path)?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            bail!(
+                "system executable parent directories must be root-owned and not writable by group or other users"
+            );
+        }
+        parent = path.parent();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn require_trusted_system_executable(executable: &Path) -> Result<()> {
+    let program_files = std::env::var_os("ProgramFiles").ok_or_else(|| {
+        anyhow!("ProgramFiles is unavailable; cannot install the Windows system service")
+    })?;
+    let expected = PathBuf::from(program_files)
+        .join("OpenGate")
+        .join("opengate.exe")
+        .canonicalize()
+        .with_context(|| "canonicalizing the installed Windows OpenGate executable")?;
+    let actual = executable
+        .canonicalize()
+        .with_context(|| format!("canonicalizing system executable {}", executable.display()))?;
+    if !actual
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+    {
+        bail!(
+            "Windows system services require the installed executable at {}",
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn require_trusted_system_executable(_executable: &Path) -> Result<()> {
+    bail!("system service installation is unsupported on this platform")
 }
 
 pub fn uninstall(system: bool) -> Result<()> {
@@ -194,8 +262,8 @@ fn install_linux(executable: &Path, dir: &Path, system: bool, full_admin: bool) 
         if dir != Path::new("/var/lib/opengate") {
             bail!("system services require the dedicated state path /var/lib/opengate");
         }
-        if !command_ok(Command::new("getent").args(["passwd", "opengate"]))? {
-            run(Command::new("useradd").args([
+        if !command_ok(Command::new("/usr/bin/getent").args(["passwd", "opengate"]))? {
+            run(Command::new("/usr/sbin/useradd").args([
                 "--system",
                 "--home-dir",
                 "/var/lib/opengate",
@@ -212,7 +280,7 @@ fn install_linux(executable: &Path, dir: &Path, system: bool, full_admin: bool) 
         };
         // State is a root-owned 0700 directory while this installer runs.  Do
         // not follow a malicious symlink while preserving an existing identity.
-        run(Command::new("chown")
+        run(Command::new("/usr/bin/chown")
             .args(["--recursive", "--no-dereference", owner])
             .arg(dir))?;
         fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
@@ -220,20 +288,25 @@ fn install_linux(executable: &Path, dir: &Path, system: bool, full_admin: bool) 
             "/etc/systemd/system/opengate.service",
             linux_unit_with_mode(executable, dir, true, full_admin),
         )?;
-        run(Command::new("systemctl").args(["daemon-reload"]))?;
-        run(Command::new("systemctl").args(["enable", "opengate.service"]))?;
+        run(Command::new("/usr/bin/systemctl").args(["daemon-reload"]))?;
+        run(Command::new("/usr/bin/systemctl").args(["enable", "opengate.service"]))?;
         // A mode change has to replace an already running daemon; `enable
         // --now` only starts inactive units and would otherwise leave the old
         // account and sandbox in effect.
-        run(Command::new("systemctl").args(["restart", "opengate.service"]))?;
+        run(Command::new("/usr/bin/systemctl").args(["restart", "opengate.service"]))?;
     } else {
         let home = std::env::var_os("HOME")
             .ok_or_else(|| anyhow!("HOME is not set; cannot install user service"))?;
         let path = Path::new(&home).join(".config/systemd/user/opengate.service");
         fs::create_dir_all(path.parent().expect("user unit parent"))?;
         fs::write(&path, linux_unit(executable, dir, false))?;
-        run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-        run(Command::new("systemctl").args(["--user", "enable", "--now", "opengate.service"]))?;
+        run(Command::new("/usr/bin/systemctl").args(["--user", "daemon-reload"]))?;
+        run(Command::new("/usr/bin/systemctl").args([
+            "--user",
+            "enable",
+            "--now",
+            "opengate.service",
+        ]))?;
     }
     Ok(())
 }
@@ -242,16 +315,16 @@ fn install_linux(executable: &Path, dir: &Path, system: bool, full_admin: bool) 
 fn uninstall_linux(system: bool) -> Result<()> {
     use std::fs;
     if system {
-        let _ = Command::new("systemctl")
+        let _ = Command::new("/usr/bin/systemctl")
             .args(["disable", "--now", "opengate.service"])
             .status();
         let path = Path::new("/etc/systemd/system/opengate.service");
         if path.exists() {
             fs::remove_file(path)?;
         }
-        run(Command::new("systemctl").args(["daemon-reload"]))?;
+        run(Command::new("/usr/bin/systemctl").args(["daemon-reload"]))?;
     } else {
-        let _ = Command::new("systemctl")
+        let _ = Command::new("/usr/bin/systemctl")
             .args(["--user", "disable", "--now", "opengate.service"])
             .status();
         let home = std::env::var_os("HOME")
@@ -260,7 +333,7 @@ fn uninstall_linux(system: bool) -> Result<()> {
         if path.exists() {
             fs::remove_file(path)?;
         }
-        run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+        run(Command::new("/usr/bin/systemctl").args(["--user", "daemon-reload"]))?;
     }
     Ok(())
 }
@@ -285,9 +358,10 @@ fn install_windows(executable: &Path, dir: &Path, system: bool, full_admin: bool
         executable.display(),
         dir.display()
     );
-    if command_ok(Command::new("sc.exe").args(["qc", WINDOWS_SERVICE_NAME]))? {
+    let sc = windows_system_command()?;
+    if command_ok(Command::new(&sc).args(["qc", WINDOWS_SERVICE_NAME]))? {
         stop_windows_service()?;
-        run(Command::new("sc.exe").args([
+        run(Command::new(&sc).args([
             "config",
             WINDOWS_SERVICE_NAME,
             "binPath=",
@@ -300,7 +374,7 @@ fn install_windows(executable: &Path, dir: &Path, system: bool, full_admin: bool
             "",
         ]))?;
     } else {
-        run(Command::new("sc.exe").args([
+        run(Command::new(&sc).args([
             "create",
             WINDOWS_SERVICE_NAME,
             "binPath=",
@@ -313,9 +387,9 @@ fn install_windows(executable: &Path, dir: &Path, system: bool, full_admin: bool
             "",
         ]))?;
     }
-    run(Command::new("sc.exe").args(["sidtype", WINDOWS_SERVICE_NAME, "unrestricted"]))?;
-    run(Command::new("sc.exe").args(["failureflag", WINDOWS_SERVICE_NAME, "1"]))?;
-    run(Command::new("sc.exe").args([
+    run(Command::new(&sc).args(["sidtype", WINDOWS_SERVICE_NAME, "unrestricted"]))?;
+    run(Command::new(&sc).args(["failureflag", WINDOWS_SERVICE_NAME, "1"]))?;
+    run(Command::new(&sc).args([
         "failure",
         WINDOWS_SERVICE_NAME,
         "reset=",
@@ -323,7 +397,7 @@ fn install_windows(executable: &Path, dir: &Path, system: bool, full_admin: bool
         "actions=",
         "restart/5000/restart/10000/restart/30000",
     ]))?;
-    run(Command::new("sc.exe").args(["start", WINDOWS_SERVICE_NAME]))?;
+    run(Command::new(&sc).args(["start", WINDOWS_SERVICE_NAME]))?;
     Ok(())
 }
 
@@ -403,7 +477,8 @@ fn stop_windows_service() -> Result<()> {
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
 
-    let _ = Command::new("sc.exe")
+    let sc = windows_system_command()?;
+    let _ = Command::new(&sc)
         .args(["stop", WINDOWS_SERVICE_NAME])
         .status();
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
@@ -425,11 +500,28 @@ fn stop_windows_service() -> Result<()> {
     bail!("OpenGate Windows service did not stop within 30 seconds")
 }
 #[cfg(windows)]
-fn uninstall_windows(_system: bool) -> Result<()> {
-    let _ = Command::new("sc.exe")
+fn uninstall_windows(system: bool) -> Result<()> {
+    if !system {
+        bail!("Windows service removal requires --system from an elevated administrator shell");
+    }
+    let sc = windows_system_command()?;
+    let _ = Command::new(&sc)
         .args(["stop", WINDOWS_SERVICE_NAME])
         .status();
-    run(Command::new("sc.exe").args(["delete", WINDOWS_SERVICE_NAME]))
+    run(Command::new(&sc).args(["delete", WINDOWS_SERVICE_NAME]))
+}
+
+#[cfg(windows)]
+fn windows_system_command() -> Result<PathBuf> {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+    let path = PathBuf::from(root).join("System32").join("sc.exe");
+    if !path.is_file() {
+        bail!(
+            "Windows service controller is unavailable at {}",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 fn run(command: &mut Command) -> Result<()> {

@@ -54,15 +54,13 @@ case "$manager" in
   dnf) run_root dnf install -y $packages ;;
   pacman) run_root pacman -Syu --needed --noconfirm $packages ;;
 esac
-if ! command -v cargo >/dev/null 2>&1; then
+if ! command -v rustup >/dev/null 2>&1; then
   download=$(mktemp)
   trap 'rm -f "$download"' EXIT HUP INT TERM
   curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o "$download"
-  sh "$download" -y --profile minimal --default-toolchain stable
+  sh "$download" -y --profile minimal --default-toolchain 1.98.1
 fi
-if command -v rustup >/dev/null 2>&1; then
-  rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-fi
+rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
 if [ "$install_ssh" -eq 1 ]; then
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     run_root systemctl enable --now "$ssh_service"
@@ -72,12 +70,7 @@ if [ "$install_ssh" -eq 1 ]; then
 fi
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
-if command -v rustup >/dev/null 2>&1; then
-  rustup run stable cargo build --locked --release
-  rustup run stable cargo test --locked --workspace
-else
-  cargo build --locked --release
-  cargo test --locked --workspace
-fi
+rustup run 1.98.1 cargo build --locked --release
+rustup run 1.98.1 cargo test --locked --workspace
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
 scripts/package-linux.sh "$version" target/release/opengate

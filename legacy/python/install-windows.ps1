@@ -28,8 +28,6 @@ function Find-Python {
             if ($found) { return $found.FullName }
         }
     }
-    $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source -notlike '*WindowsApps*') { return $cmd.Source }
     return $null
 }
 
@@ -46,7 +44,7 @@ if (-not $Python) {
 
 $InstallDir = Join-Path $env:ProgramFiles 'OpenGate'
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-$Source = Join-Path (Split-Path $PSScriptRoot -Parent) 'opengate.py'
+$Source = Join-Path $PSScriptRoot 'opengate.py'
 Copy-Item $Source (Join-Path $InstallDir 'opengate.py') -Force
 
 $Cmd = "@echo off`r`n`"$Python`" `"$InstallDir\opengate.py`" %*`r`n"

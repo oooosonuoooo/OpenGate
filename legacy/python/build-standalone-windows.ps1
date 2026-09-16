@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$Root = Split-Path $PSScriptRoot -Parent
+$Root = $PSScriptRoot
 python -m venv "$Root\.venv-build"
 & "$Root\.venv-build\Scripts\python.exe" -m pip install --upgrade pip pyinstaller
 & "$Root\.venv-build\Scripts\pyinstaller.exe" --clean --onefile --name opengate "$Root\opengate.py"
