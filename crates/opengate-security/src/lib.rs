@@ -457,7 +457,7 @@ fn dpapi(input: &[u8], protect: bool, machine: bool) -> Result<Vec<u8>> {
         Foundation::LocalFree,
         Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptProtectData, CryptUnprotectData},
     };
-    let mut input_blob = CRYPT_INTEGER_BLOB {
+    let input_blob = CRYPT_INTEGER_BLOB {
         cbData: input.len() as u32,
         pbData: input.as_ptr() as *mut u8,
     };
